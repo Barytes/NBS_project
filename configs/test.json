@@ -1,0 +1,16 @@
+{
+  "num_users": 5,
+  "lambda0" : 50,
+  "d_range": [0.5, 2.5],
+  "b_range": [8, 80],
+  "alpha_range": [10, 15],
+  "cpu_range": [0.5, 1.2],
+  "param_groups": [
+    {
+      "f_max": 100,
+      "B_max": 40,
+      "c_E": 0.01,
+      "c_N": 0.01
+    }
+  ]
+}
