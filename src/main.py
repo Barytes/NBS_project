@@ -5,8 +5,8 @@ import pandas as pd
 import json
 import copy
 from src.config import Config
-from src.models import Task, Channel, User, Provider
-from src.utils import log_message, save_results
+# from src.models import Task, Channel, User, Provider
+# from src.utils import log_message, save_results
 
 def create_users(config,seed=None,real=False):
     rng = np.random.RandomState(seed)
