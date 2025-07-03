@@ -2,7 +2,7 @@
 import numpy as np
 from scipy.optimize import minimize
 
-def solve_ESP_subproblem(ESP, N, rho, lamb_hat, Dmax_hat, alpha, beta):
+def solve_ESP_subproblem(ESP, N, rho, last_lamb, last_Dmax, lamb_hat, Dmax_hat, alpha, beta):
     """
     全局子问题：给定 lamb_hat (N,), Dmax_hat (N,), alpha (N,), beta (N,),
     返回更新后的 lamb (N,) 和 Dmax (scalar)。
@@ -18,8 +18,8 @@ def solve_ESP_subproblem(ESP, N, rho, lamb_hat, Dmax_hat, alpha, beta):
     beta      = np.asarray(beta)
 
     # 初始猜测：全局 lambda 从 lamb_hat 开始，Dmax 用平均
-    # x0 = np.concatenate([lamb_hat, [Dmax_hat.mean()]])
-    x0 = np.ones(N+1)*np.random.rand(1)  # shape = (N+1,)
+    # x0 = np.concatenate([lamb_hat+1, [Dmax_hat.mean()+1]])
+    x0 = np.concatenate([last_lamb, [last_Dmax]])
 
     # 增广拉格朗日目标
     def obj(x):
@@ -52,12 +52,12 @@ def solve_ESP_subproblem(ESP, N, rho, lamb_hat, Dmax_hat, alpha, beta):
     Dmax = sol.x[N]
     return lamb, Dmax
 
-def solve_MD_subproblem(MDs, rho, lamb, Dmax, alpha, beta):
+def solve_MD_subproblem(MDs, rho, last_p, last_lambhat, last_Dhat, lamb, Dmax, alpha, beta):
     N = len(MDs)
     Dmax_arr = np.ones(N) * Dmax
     # ---- 把旧值拼成初始猜测 x0 ----
-    x0 = np.ones(3 * N)  # shape = (3N,)
-    # x0 = np.concatenate([p_old, lamb, Dmax_arr])     # shape = (3N,)
+    # x0 = np.ones(3 * N)  # shape = (3N,)
+    x0 = np.concatenate([last_p, last_lambhat, last_Dhat])
 
     # ---- 目标函数：各 MD 项求和 ----
     def obj_joint(x):
@@ -126,24 +126,54 @@ def ADMM(ESP,MDs):
     Dmax, p, lamb = ESP.D0/2, np.array([md.Fn/2 for md in MDs]), np.array([0.1 for _ in range(N)])
     lamb_hat,Dmax_hat = np.ones(N), np.ones(N)
     alpha, beta = np.ones(N), np.ones(N)
-    epsilon = 1e-6
-    rho = 5
-    Dmax_old, p_old = 0.01, 0.01
+    eps_abs, eps_rel = 1e-3, 1e-3
+    rho = 100
+    Dmax_old, p_old, lamb_old = 0.01, 0.01, 0.01
+    lamb_hat_old, Dmax_hat_old = np.zeros(N), np.zeros(N)
     while True:
-        if (np.linalg.norm(lamb_hat-lamb) < epsilon and
-            np.linalg.norm(Dmax_hat-Dmax) < epsilon and
-            np.linalg.norm(p_old-p) < epsilon and
-            abs(Dmax-Dmax_old) < epsilon):
+        # if (np.linalg.norm(lamb_old-lamb) < epsilon and
+        #     np.linalg.norm(p_old-p) < epsilon and
+        #     abs(Dmax-Dmax_old) < epsilon) and \
+        #     (np.linalg.norm(alpha_old-alpha) < epsilon and
+        #      np.linalg.norm(beta_old-beta) < epsilon):
+        #     break
+
+        # --- residuals (after primal updates) ---
+        r = np.hstack([lamb_hat - lamb,        # size N
+                    Dmax_hat    - Dmax])       # size N
+
+        s_p = rho * (p - p_old)
+        s_lambda = rho * (lamb_hat - lamb_hat_old)
+        s_Dmax   = -rho * np.sum(Dmax_hat - Dmax_hat_old)
+        s = np.hstack([s_p, s_lambda, s_Dmax])      # size N+1
+
+        # --- tolerances ---
+        eps_pri  = np.sqrt(2*N)*eps_abs + \
+                eps_rel * max(np.linalg.norm(lamb),
+                                np.linalg.norm(lamb_hat),
+                                abs(Dmax)*np.sqrt(N),
+                                np.linalg.norm(Dmax_hat))
+
+        eps_dual = np.sqrt(N+1)*eps_abs + \
+                eps_rel * np.linalg.norm(np.hstack([alpha, beta]))
+
+        # --- stopping test ---
+        if np.linalg.norm(r,2) <= eps_pri and np.linalg.norm(s,2) <= eps_dual:
             break
-        Dmax_old, p_old = Dmax, p
+
+        Dmax_old, p_old, lamb_old = Dmax, p, lamb
+        lamb_hat_old, Dmax_hat_old = lamb_hat, Dmax_hat
+        alpha_old, beta_old = alpha, beta
         # ESP's global subproblem
-        lamb,Dmax = solve_ESP_subproblem(ESP,N,rho,lamb_hat,Dmax_hat,alpha,beta)
+        lamb,Dmax = solve_ESP_subproblem(ESP,N,rho, lamb_old, Dmax_old,lamb_hat,Dmax_hat,alpha,beta)
         # MDs' local subproblem
-        p, lamb_hat,Dmax_hat = solve_MD_subproblem(MDs,rho, lamb, Dmax, alpha, beta)
+        p, lamb_hat,Dmax_hat = solve_MD_subproblem(MDs,rho, p_old, lamb_hat_old, Dmax_hat_old, lamb, Dmax, alpha, beta)
         # dual variable update
         alpha += rho*(lamb-lamb_hat)
         beta += rho*([Dmax for i in range(N)]-Dmax_hat)
-
+    print("lamb:", lamb, lamb_hat)
+    print("Dmax:", Dmax, Dmax_hat)
+    print("p:", p)
     return lamb, p, Dmax
 
 def negotiation(ESP,MDs,lamb,p,Dmax):
