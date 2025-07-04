@@ -27,7 +27,8 @@ def solve_ESP_subproblem(ESP, N, rho, last_lamb, last_Dmax, lamb_hat, Dmax_hat, 
         Dmax   = x[N]
         Dmax_arr = np.ones(N) * Dmax
         # ESP 的目标项
-        term_esp = -lambda0*theta + o/(D0-Dmax)
+        # term_esp = -lambda0*theta + o/(D0-Dmax)
+        term_esp = -(np.sum(lam) * theta - o / (D0 - Dmax))
         # 乘子线性项 + 二次罚项
         term_l = alpha.dot(lam - lamb_hat) + (rho/2)*np.sum((lam - lamb_hat)**2)
         term_D = beta.dot(Dmax_arr - Dmax_hat) + (rho/2)*np.sum((Dmax_arr - Dmax_hat)**2)
@@ -45,7 +46,7 @@ def solve_ESP_subproblem(ESP, N, rho, last_lamb, last_Dmax, lamb_hat, Dmax_hat, 
         method='SLSQP',
         bounds=bounds,
         constraints=cons,
-        options={'ftol': 1e-5, 'disp': False}
+        options={'ftol': 1e-6, 'maxiter': 1000, 'disp': False}
     )
 
     # if not sol.success:
@@ -112,7 +113,7 @@ def solve_MD_subproblem(MDs, rho, last_p, last_lambhat, last_Dhat, lamb, Dmax, a
         method='SLSQP',
         bounds=bounds,
         constraints=ineq_cons,
-        options={'ftol': 1e-5, 'disp': False}
+        options={'ftol': 1e-6, 'maxiter': 1000, 'disp': False}
     )
 
     # if not sol.success:
@@ -133,7 +134,7 @@ def ADMM(ESP,MDs):
     lamb_hat,Dmax_hat = np.ones(N), np.ones(N)
     alpha, beta = np.ones(N), np.ones(N)
     eps_abs, eps_rel = 1e-3, 1e-3
-    rho     = 10.0        # 初值
+    rho     = 100.0        # 初值
     mu, tau = 10, 2      # Boyd 推荐：μ=10, τ=2
     Dmax_old, p_old, lamb_old = 0.01, 0.01, 0.01
     lamb_hat_old, Dmax_hat_old = np.zeros(N), np.zeros(N)
