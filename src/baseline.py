@@ -34,8 +34,6 @@ def social_welfare_maximization(ESP, MDs):
     lambda0 = ESP.lambda0
     theta = ESP.theta
     o = ESP.o
-    w0 = ESP.omega_0
-    w = [md.omega_n for md in MDs]
     eps = 1e-6
     F = np.array([md.Fn for md in MDs])  # (N,)
     s, l = MDs[0].s, MDs[0].l  # 所有MD的s和l相同
@@ -45,15 +43,22 @@ def social_welfare_maximization(ESP, MDs):
     def Q(Dmax):
         return lambda0*theta - o / (D0 - Dmax)
 
-    def L(p):
-        return np.sum([md.cn*(pn**2)+(md.Fn)**md.kn-(md.Fn-pn)**md.kn for md, pn in zip(MDs, p)])
+    def sum_L(p):
+        # return np.sum([md.cn*(pn**2)+(md.Fn)**md.kn-(md.Fn-pn)**md.kn for md, pn in zip(MDs, p)])
+        res = []
+        for md, pn in zip(MDs, p):
+            delta = md.Fn - pn
+            if delta < 0:
+                delta = 0
+            res.append(md.cn*(pn**2) + (md.Fn)**md.kn - (delta)**md.kn)
+        return np.sum(res)
 
     def objective(x):
         lam = x[0:N]
         p   = x[N:2*N]
         Dm  = x[-1]
         term_esp = Q(Dm)
-        term_md  = L(p)
+        term_md  = sum_L(p)
         return -(term_esp + term_md)          # 最大化 → 取负
 
     # ----------- 约束 -----------
@@ -72,14 +77,19 @@ def social_welfare_maximization(ESP, MDs):
         p   = x[N:2*N]
         Dm  = x[-1]
         res = []
-        # 12c  λ ≤ p/(s l) - ε
-        res.extend(p / (s * l) - lam - eps)
-        # 12d  p ≤ F_n
-        res.extend(F - p)
-        # 12e  D_n(λ,p) ≤ D_max - ε
-        res.extend(Dm - Dn(lam, p))
-        # Dm ≤ D0 - ε
-        res.append(D0 - eps - Dm)
+        res1 = p / (s * l) - lam - eps
+        res2 = F - p
+        res3 = Dm - Dn(lam, p)
+        res4 = D0 - eps - Dm
+        res5 = Q(Dm) - sum_L(p)  # 确保 Q(Dm) - ΣL(p) ≥ eps
+        # print("约束1:", res1)
+        # print("约束2:", res2)
+        # print("约束3:", res3)
+        # print("约束4:", res4)
+        res.extend(res1)
+        res.extend(res2)
+        res.extend(res3)
+        res.append(res4)
         return np.asarray(res)
 
     # ----------- 初始可行点 -----------
@@ -99,22 +109,42 @@ def social_welfare_maximization(ESP, MDs):
     # print("Dm0:", Dm0)
     # print("g_eq(x0):", g_eq(x0))
     # print("g_ineq(x0):", g_ineq(x0))
+    # print("L(p0):",L(p0))
 
     cons = (
         {'type': 'eq',   'fun': g_eq},
         {'type': 'ineq', 'fun': g_ineq},
     )
 
+    # sol = minimize(
+    #     objective, x0,
+    #     method='SLSQP',
+    #     bounds=bounds,
+    #     constraints=cons,
+    #     options={
+    #     'ftol': 1e-8,
+    #     'maxiter': 2000,
+    #     'disp': True
+    #     }
+    # )
     sol = minimize(
         objective, x0,
-        method='SLSQP',
+        method='trust-constr',
+        jac='2-point',
+        hess='3-point',
         bounds=bounds,
         constraints=cons,
-        options={'ftol': 1e-7, 'maxiter': 1000, 'disp': False}
+        options={
+            'verbose':    3,       # 打印迭代信息
+            'xtol':       1e-9,    # 步长收敛
+            'gtol':       1e-9,    # 梯度收敛
+            'barrier_tol':1e-9,    # 障碍收敛
+            'maxiter':    2000
+        }
     )
 
-    # if not sol.success:
-    #     raise RuntimeError("SLSQP failed: "+sol.message)
+    if not sol.success:
+        print(f"求解失败：{sol.status} : {sol.message}")
 
     lam_opt = sol.x[0:N]
     p_opt   = sol.x[N:2*N]
@@ -139,7 +169,14 @@ def optimal_NBP(ESP,MDs):
         return lambda0*theta - o / (D0 - Dmax)
 
     def L(p):
-        return np.asarray([md.cn*(pn**2)+(md.Fn)**md.kn-(md.Fn-pn)**md.kn for md, pn in zip(MDs, p)])
+        # return np.asarray([md.cn*(pn**2)+(md.Fn)**md.kn-(md.Fn-pn)**md.kn for md, pn in zip(MDs, p)])
+        res = []
+        for md, pn in zip(MDs, p):
+            delta = md.Fn - pn
+            if delta < 0:
+                delta = 0
+            res.append(md.cn*(pn**2) + (md.Fn)**md.kn - (delta)**md.kn)
+        return np.asarray(res)
 
     def objective(x):
         lam = x[0:N]
@@ -178,8 +215,9 @@ def optimal_NBP(ESP,MDs):
         # Dm ≤ D0 - ε
         res.append(D0 - eps - Dm)
         # r_0 argument log(Q - Σr) : Q(Dm)-Σr  ≥ eps
-        res.append(Q(Dm) - np.sum(r) - eps)
-        return np.asarray(res)
+        res.append(Q(Dm) - np.sum(r))
+        res.extend((r - L(p) - eps).tolist())
+        return res
 
     # ----------- 初始可行点 -----------
     lam0 = np.full(N, lambda0 / N)
@@ -207,16 +245,36 @@ def optimal_NBP(ESP,MDs):
         {'type': 'ineq', 'fun': g_ineq},
     )
 
+    # sol = minimize(
+    #     objective, x0,
+    #     method='SLSQP',
+    #     bounds=bounds,
+    #     constraints=cons,
+    #     options={
+    #         'ftol': 1e-8,
+    #         'maxiter': 2000,
+    #         'disp': True
+    #     }
+    # )
+
     sol = minimize(
         objective, x0,
-        method='SLSQP',
+        method='trust-constr',
+        jac='2-point',
+        hess='3-point',
         bounds=bounds,
         constraints=cons,
-        options={'ftol': 1e-7, 'maxiter': 1000, 'disp': False}
+        options={
+            'verbose':    3,       # 打印迭代信息
+            'xtol':       1e-9,    # 步长收敛
+            'gtol':       1e-9,    # 梯度收敛
+            'barrier_tol':1e-9,    # 障碍收敛
+            'maxiter':    2000
+        }
     )
 
-    # if not sol.success:
-    #     raise RuntimeError("SLSQP failed: "+sol.message)
+    if not sol.success:
+        print(f"求解失败：{sol.status} : {sol.message}")
 
     lam_opt = sol.x[0:N]
     p_opt   = sol.x[N:2*N]
