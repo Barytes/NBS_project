@@ -45,8 +45,11 @@ def solve_ESP_subproblem(ESP, N, rho, last_lamb, last_Dmax, lamb_hat, Dmax_hat, 
         method='SLSQP',
         bounds=bounds,
         constraints=cons,
-        options={'ftol': 1e-4, 'disp': False}
+        options={'ftol': 1e-5, 'disp': False}
     )
+
+    # if not sol.success:
+    #     raise RuntimeError("SLSQP failed: "+sol.message)
 
     lamb = sol.x[:N]
     Dmax = sol.x[N]
@@ -109,8 +112,11 @@ def solve_MD_subproblem(MDs, rho, last_p, last_lambhat, last_Dhat, lamb, Dmax, a
         method='SLSQP',
         bounds=bounds,
         constraints=ineq_cons,
-        options={'ftol': 1e-4, 'disp': False}
+        options={'ftol': 1e-5, 'disp': False}
     )
+
+    # if not sol.success:
+    #     raise RuntimeError("SLSQP failed: "+sol.message)
 
     # 拆分回三个 ndarray
     x_opt = sol.x
@@ -127,11 +133,20 @@ def ADMM(ESP,MDs):
     lamb_hat,Dmax_hat = np.ones(N), np.ones(N)
     alpha, beta = np.ones(N), np.ones(N)
     eps_abs, eps_rel = 1e-3, 1e-3
-    rho     = 100.0        # 初值
+    rho     = 10.0        # 初值
     mu, tau = 10, 2      # Boyd 推荐：μ=10, τ=2
     Dmax_old, p_old, lamb_old = 0.01, 0.01, 0.01
     lamb_hat_old, Dmax_hat_old = np.zeros(N), np.zeros(N)
     while True:
+        Dmax_old, p_old, lamb_old = Dmax, p, lamb
+        lamb_hat_old, Dmax_hat_old = lamb_hat, Dmax_hat
+        # ESP's global subproblem
+        lamb,Dmax = solve_ESP_subproblem(ESP,N,rho, lamb_old, Dmax_old,lamb_hat,Dmax_hat,alpha,beta)
+        # MDs' local subproblem
+        p, lamb_hat,Dmax_hat = solve_MD_subproblem(MDs,rho, p_old, lamb_hat_old, Dmax_hat_old, lamb, Dmax, alpha, beta)
+        # dual variable update
+        alpha += rho*(lamb-lamb_hat)
+        beta += rho*([Dmax for i in range(N)]-Dmax_hat)
         # --- residuals (after primal updates) ---
         r = np.hstack([lamb_hat - lamb,        # size N
                     Dmax_hat    - Dmax])       # size N
@@ -159,20 +174,11 @@ def ADMM(ESP,MDs):
         if np.linalg.norm(r,2) <= eps_pri and np.linalg.norm(s,2) <= eps_dual:
             break
 
-        if np.linalg.norm(r) > mu*np.linalg.norm(s):
-            rho *= tau;   alpha /= tau;   beta /= tau
-        elif np.linalg.norm(s) > mu*np.linalg.norm(r):
-            rho /= tau;   alpha *= tau;   beta *= tau
+        if np.linalg.norm(r,2) > mu*np.linalg.norm(s,2):
+            rho *= tau
+        elif np.linalg.norm(s,2) > mu*np.linalg.norm(r,2):
+            rho /= tau
 
-        Dmax_old, p_old, lamb_old = Dmax, p, lamb
-        lamb_hat_old, Dmax_hat_old = lamb_hat, Dmax_hat
-        # ESP's global subproblem
-        lamb,Dmax = solve_ESP_subproblem(ESP,N,rho, lamb_old, Dmax_old,lamb_hat,Dmax_hat,alpha,beta)
-        # MDs' local subproblem
-        p, lamb_hat,Dmax_hat = solve_MD_subproblem(MDs,rho, p_old, lamb_hat_old, Dmax_hat_old, lamb, Dmax, alpha, beta)
-        # dual variable update
-        alpha += rho*(lamb-lamb_hat)
-        beta += rho*([Dmax for i in range(N)]-Dmax_hat)
     print("lamb:", lamb, lamb_hat)
     print("Dmax:", Dmax, Dmax_hat)
     print("p:", p)
