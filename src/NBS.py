@@ -45,7 +45,7 @@ def solve_ESP_subproblem(ESP, N, rho, last_lamb, last_Dmax, lamb_hat, Dmax_hat, 
         method='SLSQP',
         bounds=bounds,
         constraints=cons,
-        options={'ftol': 1e-6, 'disp': False}
+        options={'ftol': 1e-4, 'disp': False}
     )
 
     lamb = sol.x[:N]
@@ -109,7 +109,7 @@ def solve_MD_subproblem(MDs, rho, last_p, last_lambhat, last_Dhat, lamb, Dmax, a
         method='SLSQP',
         bounds=bounds,
         constraints=ineq_cons,
-        options={'ftol': 1e-6, 'disp': False}
+        options={'ftol': 1e-4, 'disp': False}
     )
 
     # 拆分回三个 ndarray
@@ -127,25 +127,23 @@ def ADMM(ESP,MDs):
     lamb_hat,Dmax_hat = np.ones(N), np.ones(N)
     alpha, beta = np.ones(N), np.ones(N)
     eps_abs, eps_rel = 1e-3, 1e-3
-    rho = 100
+    rho     = 100.0        # 初值
+    mu, tau = 10, 2      # Boyd 推荐：μ=10, τ=2
     Dmax_old, p_old, lamb_old = 0.01, 0.01, 0.01
     lamb_hat_old, Dmax_hat_old = np.zeros(N), np.zeros(N)
     while True:
-        # if (np.linalg.norm(lamb_old-lamb) < epsilon and
-        #     np.linalg.norm(p_old-p) < epsilon and
-        #     abs(Dmax-Dmax_old) < epsilon) and \
-        #     (np.linalg.norm(alpha_old-alpha) < epsilon and
-        #      np.linalg.norm(beta_old-beta) < epsilon):
-        #     break
-
         # --- residuals (after primal updates) ---
         r = np.hstack([lamb_hat - lamb,        # size N
                     Dmax_hat    - Dmax])       # size N
 
-        s_p = rho * (p - p_old)
-        s_lambda = rho * (lamb_hat - lamb_hat_old)
-        s_Dmax   = -rho * np.sum(Dmax_hat - Dmax_hat_old)
-        s = np.hstack([s_p, s_lambda, s_Dmax])      # size N+1
+        # Δhat 记号
+        d_lamh = lamb_hat - lamb_hat_old          # Δ λ̂  (shape N,)
+        d_Dh   = Dmax_hat - Dmax_hat_old          # Δ D̂  (shape N,)
+
+        # 对偶残差（p 块在 A^T B 中系数为 0，应当被忽略）
+        s_lambda = -rho * d_lamh                  # shape N
+        s_Dmax   = -rho * np.sum(d_Dh)            # 标量
+        s = np.hstack([s_lambda, s_Dmax])         # shape N+1
 
         # --- tolerances ---
         eps_pri  = np.sqrt(2*N)*eps_abs + \
@@ -161,9 +159,13 @@ def ADMM(ESP,MDs):
         if np.linalg.norm(r,2) <= eps_pri and np.linalg.norm(s,2) <= eps_dual:
             break
 
+        if np.linalg.norm(r) > mu*np.linalg.norm(s):
+            rho *= tau;   alpha /= tau;   beta /= tau
+        elif np.linalg.norm(s) > mu*np.linalg.norm(r):
+            rho /= tau;   alpha *= tau;   beta *= tau
+
         Dmax_old, p_old, lamb_old = Dmax, p, lamb
         lamb_hat_old, Dmax_hat_old = lamb_hat, Dmax_hat
-        alpha_old, beta_old = alpha, beta
         # ESP's global subproblem
         lamb,Dmax = solve_ESP_subproblem(ESP,N,rho, lamb_old, Dmax_old,lamb_hat,Dmax_hat,alpha,beta)
         # MDs' local subproblem

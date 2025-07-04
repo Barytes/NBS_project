@@ -1,0 +1,14 @@
+{
+  "num_mds" : 5,
+  "lambda0" : 12,                
+  "s" : 2,                      
+  "l" : 200,                     
+  "D0": 1,                       
+  "cn_range": [1e-9, 5e-9],     
+  "kn_range": [0.2, 0.8],        
+  "Fn_range": [1.0, 3.0],       
+  "theta": 5,
+  "o": 10,
+  "omega_0": 2,
+  "omega_n": 1       
+}
