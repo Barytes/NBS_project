@@ -1,13 +1,15 @@
 # src/model.py
 import numpy as np
 
-def social_welfare(ESP,MDs,Dmax,p,r):
+def social_welfare(ESP,MDs,lam,p):
     L = [md.Ln(pn) for (pn,md) in zip(p,MDs)]
+    Dmax = max([md.s/md.Rn + 1/(pn/(md.s*md.l)-lamn) for (md,pn,lamn) in zip(MDs,p,lam)])
     return ESP.Q(Dmax)-sum(L)
 
-def nash_product_log(ESP,MDs,Dmax,p,r):
-    n0 = ESP.omega_0 * np.ln(ESP.Q(Dmax)-np.sum(r))
-    ns = [md.omega_n*np.ln(rn-md.Ln(pn)) for (md,rn,pn) in zip(MDs,r,p)]
+def nash_product_log(ESP,MDs,lam,p,r):
+    Dmax = max([md.s/md.Rn + 1/(pn/(md.s*md.l)-lamn) for (md,pn,lamn) in zip(MDs,p,lam)])
+    n0 = ESP.omega_0 * np.log(ESP.Q(Dmax)-np.sum(r))
+    ns = [md.omega_n*np.log(rn-md.Ln(pn)) for (md,rn,pn) in zip(MDs,r,p)]
     return n0+np.sum(ns)
 
 class MD:

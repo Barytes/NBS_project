@@ -35,7 +35,7 @@ def solve_ESP_subproblem(ESP, N, rho, last_lamb, last_Dmax, lamb_hat, Dmax_hat, 
         val = term_esp + term_l + term_D
         if not np.isfinite(val):
             return 1e20   # 给一个大的惩罚值，逼它回到可行域
-        return val
+        return val/100
 
     # 约束：sum(lam)=lambda0；0<=lam；0<=D<=D0−ε
     cons = ({
@@ -91,7 +91,7 @@ def solve_MD_subproblem(MDs, rho, last_p, last_lambhat, last_Dhat, lamb, Dmax, a
         if not np.isfinite(val):
             return 1e20   # 给一个大的惩罚值，逼它回到可行域
 
-        return val
+        return val/100
 
     # ---- 约束与边界 ----
     bounds = []
@@ -114,7 +114,7 @@ def solve_MD_subproblem(MDs, rho, last_p, last_lambhat, last_Dhat, lamb, Dmax, a
         idx_D   = 2*N + i
 
         def lam_upper(x):
-            return  x[idx_p]/(md.s * md.l) - x[idx_lam]-1e-8   # ≥0
+            return  x[idx_p]/(md.s * md.l) - x[idx_lam]-1   # ≥0
         ineq_cons.append({'type': 'ineq', 'fun': lam_upper})
         def Dn_Dh(x):
             return x[idx_D] - md.s/md.Rn-1/(x[idx_p]/(md.s * md.l) - x[idx_lam]+1e-8)  # ≥0
@@ -146,7 +146,7 @@ def ADMM(ESP,MDs):
     Dmax, p, lamb = ESP.D0/2, np.array([md.Fn/2 for md in MDs]), np.array([ESP.lambda0/N for _ in range(N)])
     lamb_hat,Dmax_hat = np.ones(N), np.ones(N)
     alpha, beta = np.ones(N), np.ones(N)
-    eps_abs, eps_rel = 1e-3, 1e-3
+    eps_abs, eps_rel = 1e-4, 1e-3
     rho     = 5.0        # 初值
     mu, tau = 10, 2      # Boyd 推荐：μ=10, τ=2
     Dmax_old, p_old, lamb_old = 0.01, 0.01, 0.01
@@ -194,10 +194,10 @@ def ADMM(ESP,MDs):
         elif np.linalg.norm(s,2) > mu*np.linalg.norm(r,2):
             rho /= tau
 
-        print(" iter", t,
-        "||lam-lam_hat||=", np.linalg.norm(lamb-lamb_hat),
-        "  alpha=", alpha,
-        "  beta=", beta)
+        # print(" iter", t,
+        # "||lam-lam_hat||=", np.linalg.norm(lamb-lamb_hat),
+        # "  alpha=", alpha,
+        # "  beta=", beta)
         
         t += 1
 
@@ -205,10 +205,12 @@ def ADMM(ESP,MDs):
 
 def negotiation(ESP,MDs,lamb,p,Dmax):
     N = len(MDs)
-    Q_star,L_star = ESP.Q(Dmax), [md.Ln(p[i]) for i,md in enumerate(MDs)]
+    Dm = max([md.s/md.Rn + 1/(pn/(md.s*md.l)-lamn) for (md,pn,lamn) in zip(MDs,p,lamb)])
+    Q_star,L_star = ESP.Q(Dm), [md.Ln(p[i]) for i,md in enumerate(MDs)]
+    # print(f"Q_star={Q_star}, L_star={L_star}, Dm={Dm}")
     M,S_star = 1e5, Q_star-np.sum(L_star)
     gamma_high, gamma_low = M, ESP.omega_0/S_star
-    epsilon = 1
+    epsilon = 1e-8
     r0 = -1
     r = np.array([])
     while True:
