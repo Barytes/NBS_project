@@ -57,6 +57,8 @@ class ESP:
         self.theta = param["theta"]
         self.o = param["o"]
         self.omega_0 = param["omega_0"]
+        self.s = param["s"]
+        self.l = param["l"]
 
     def Q(self,Dmax):
         if self.D0 < Dmax-1e-3: return None

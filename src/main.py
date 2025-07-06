@@ -21,7 +21,9 @@ def create_ESP(config,seed=None):
         "D0": config.params["D0"],
         "theta": config.params["theta"],
         "o": config.params["o"],
-        "omega_0": config.params["omega_0"]
+        "omega_0": config.params["omega_0"],
+        "s": config.params["s"],
+        "l": config.params["l"]
     }
     return ESP(ESP_param)
 

@@ -2,7 +2,7 @@
 import numpy as np
 from scipy.optimize import minimize
 
-def solve_ESP_subproblem(ESP, N, rho, last_lamb, last_Dmax, lamb_hat, Dmax_hat, alpha, beta):
+def solve_ESP_subproblem(ESP, N, rho, last_lamb, last_Dmax, last_p, lamb_hat, Dmax_hat, alpha, beta):
     """
     全局子问题：给定 lamb_hat (N,), Dmax_hat (N,), alpha (N,), beta (N,),
     返回更新后的 lamb (N,) 和 Dmax (scalar)。
@@ -11,6 +11,7 @@ def solve_ESP_subproblem(ESP, N, rho, last_lamb, last_Dmax, lamb_hat, Dmax_hat, 
     lambda0 = ESP.lambda0
     theta = ESP.theta
     o = ESP.o
+    s, l = ESP.s, ESP.l  # 所有 MD 的 s 和 l 相同
 
     lamb_hat  = np.asarray(lamb_hat)
     Dmax_hat  = np.asarray(Dmax_hat)
@@ -18,7 +19,6 @@ def solve_ESP_subproblem(ESP, N, rho, last_lamb, last_Dmax, lamb_hat, Dmax_hat, 
     beta      = np.asarray(beta)
 
     # 初始猜测：全局 lambda 从 lamb_hat 开始，Dmax 用平均
-    # x0 = np.concatenate([lamb_hat+1, [Dmax_hat.mean()+1]])
     x0 = np.concatenate([last_lamb, [last_Dmax]])
 
     # 增广拉格朗日目标
@@ -32,28 +32,29 @@ def solve_ESP_subproblem(ESP, N, rho, last_lamb, last_Dmax, lamb_hat, Dmax_hat, 
         # 乘子线性项 + 二次罚项
         term_l = alpha.dot(lam - lamb_hat) + (rho/2)*np.sum((lam - lamb_hat)**2)
         term_D = beta.dot(Dmax_arr - Dmax_hat) + (rho/2)*np.sum((Dmax_arr - Dmax_hat)**2)
-        val = term_esp + term_l + term_D
+        val = term_esp + term_l + term_D + 0.5*1e-4*np.sum(lam**2)
         if not np.isfinite(val):
             return 1e20   # 给一个大的惩罚值，逼它回到可行域
-        return val/100
+        return val
 
     # 约束：sum(lam)=lambda0；0<=lam；0<=D<=D0−ε
     cons = ({
         'type': 'eq',
         'fun': lambda x: np.sum(x[:N]) - lambda0
-    },)
-    bounds = [(0, None)]*N + [(0, D0 - 1e-9)]
+    })
+    cap = np.maximum(last_p/(s*l) - 1e-6, lambda0)  # 把负数替换成 λ0
+    bounds = [(0, cap_i) for cap_i in cap] + [(1e-6, D0-1e-6)]
 
     sol = minimize(
         obj, x0,
         method='SLSQP',
         bounds=bounds,
         constraints=cons,
-        options={'ftol': 1e-6, 'maxiter': 1000, 'disp': False}
+        options={'ftol': 1e-9, 'maxiter': 2000, 'disp': False}
     )
 
     if not sol.success:
-        print(f"SLSQP failed: {sol.message}")
+        print(f"ESP SLSQP failed: {sol.message}")
 
     lamb = sol.x[:N]
     Dmax = sol.x[N]
@@ -73,13 +74,11 @@ def solve_MD_subproblem(MDs, rho, last_p, last_lambhat, last_Dhat, lamb, Dmax, a
         Dh     = x[2*N:3*N]
 
         # ∑L_n  —— 效用项
-        res = []
+
+        term_u = 0.0
         for md, pn in zip(MDs, p_vec):
-            delta = md.Fn - pn
-            if delta < 0:
-                delta = 0
-        res.append(md.cn*md.s*md.l*(pn**2) + (md.Fn)**md.kn - (delta)**md.kn)
-        term_u = np.sum(res)
+            delta = max(md.Fn - pn, 0.0)
+            term_u += md.cn*pn**2 + md.Fn**md.kn - delta**md.kn
 
         # ∑  α_i(λ_i-λ̂_i) + ½ρ(λ_i-λ̂_i)²
         term_l = np.dot(alpha, (lamb - lamh)) + (rho/2)*np.sum((lamb - lamh)**2)
@@ -90,8 +89,8 @@ def solve_MD_subproblem(MDs, rho, last_p, last_lambhat, last_Dhat, lamb, Dmax, a
         val = term_u + term_l + term_D
         if not np.isfinite(val):
             return 1e20   # 给一个大的惩罚值，逼它回到可行域
-
-        return val/100
+        
+        return val
 
     # ---- 约束与边界 ----
     bounds = []
@@ -114,7 +113,7 @@ def solve_MD_subproblem(MDs, rho, last_p, last_lambhat, last_Dhat, lamb, Dmax, a
         idx_D   = 2*N + i
 
         def lam_upper(x):
-            return  x[idx_p]/(md.s * md.l) - x[idx_lam]-1e-3   # ≥0
+            return  x[idx_p]/(md.s * md.l) - x[idx_lam]-1e-8   # ≥0
         ineq_cons.append({'type': 'ineq', 'fun': lam_upper})
         def Dn_Dh(x):
             return x[idx_D] - md.s/md.Rn-1/(x[idx_p]/(md.s * md.l) - x[idx_lam]+1e-8)  # ≥0
@@ -126,11 +125,11 @@ def solve_MD_subproblem(MDs, rho, last_p, last_lambhat, last_Dhat, lamb, Dmax, a
         method='SLSQP',
         bounds=bounds,
         constraints=ineq_cons,
-        options={'ftol': 1e-6, 'maxiter': 1000, 'disp': False}
+        options={'ftol': 1e-9, 'maxiter': 2000, 'disp': False}
     )
 
     if not sol.success:
-        print(f"SLSQP failed: {sol.message}")
+        print(f"MD SLSQP failed: {sol.message}")
 
     # 拆分回三个 ndarray
     x_opt = sol.x
@@ -146,17 +145,17 @@ def ADMM(ESP,MDs):
     Dmax, p, lamb = ESP.D0/2, np.array([md.Fn/2 for md in MDs]), np.array([ESP.lambda0/N for _ in range(N)])
     lamb_hat,Dmax_hat = np.ones(N), np.ones(N)
     alpha, beta = np.ones(N), np.ones(N)
-    eps_abs, eps_rel = 1e-4, 1e-3
+    eps_abs, eps_rel = 1e-6, 1e-6
     rho     = 5.0        # 初值
     mu, tau = 10, 2      # Boyd 推荐：μ=10, τ=2
     Dmax_old, p_old, lamb_old = 0.01, 0.01, 0.01
     lamb_hat_old, Dmax_hat_old = np.zeros(N), np.zeros(N)
-    t,maxiter = 0,50
+    t,maxiter = 0,1000
     while t<=maxiter:
         Dmax_old, p_old, lamb_old = Dmax, p, lamb
         lamb_hat_old, Dmax_hat_old = lamb_hat, Dmax_hat
         # ESP's global subproblem
-        lamb,Dmax = solve_ESP_subproblem(ESP,N,rho, lamb_old, Dmax_old,lamb_hat,Dmax_hat,alpha,beta)
+        lamb,Dmax = solve_ESP_subproblem(ESP,N,rho, lamb_old, Dmax_old, p_old,lamb_hat,Dmax_hat,alpha,beta)
         # MDs' local subproblem
         p, lamb_hat,Dmax_hat = solve_MD_subproblem(MDs,rho, p_old, lamb_hat_old, Dmax_hat_old, lamb, Dmax, alpha, beta)
         # dual variable update
@@ -194,10 +193,13 @@ def ADMM(ESP,MDs):
         elif np.linalg.norm(s,2) > mu*np.linalg.norm(r,2):
             rho /= tau
 
-        # print(" iter", t,
-        # "||lam-lam_hat||=", np.linalg.norm(lamb-lamb_hat),
-        # "  alpha=", alpha,
-        # "  beta=", beta)
+        print(" iter", t,
+        "||lam-lam_hat||=", np.linalg.norm(lamb-lamb_hat),
+        "||Dmax-Dmax_hat||=", np.linalg.norm(Dmax-Dmax_hat),
+        "||r||=", np.linalg.norm(r,2),
+        "||s||=", np.linalg.norm(s,2),
+        "  alpha=", alpha,
+        "  beta=", beta)
         
         t += 1
 

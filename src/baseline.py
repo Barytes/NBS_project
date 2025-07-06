@@ -45,6 +45,9 @@ def social_welfare_maximization(ESP, MDs):
         return lambda0*theta - o / (D0 - Dmax)
 
     def sum_L(p):
+        for i,md in enumerate(MDs):
+            if p[i] < 0: p[i] = eps
+            elif p[i] > md.Fn: p[i] = md.Fn - eps
         return np.sum([md.cn*(pn**2)+(md.Fn)**md.kn-(md.Fn-pn)**md.kn for md, pn in zip(MDs, p)])
 
     def objective(x):
@@ -53,7 +56,8 @@ def social_welfare_maximization(ESP, MDs):
         Dm  = x[-1]
         term_esp = Q(Dm)
         term_md  = sum_L(p)
-        return -(term_esp + term_md)+1*np.linalg.norm(lam,2)        # 最大化 → 取负
+        # return -(term_esp - term_md)
+        return -(term_esp - term_md)+0.1*np.linalg.norm(lam,2)       # 最大化 → 取负
 
     # ----------- 约束 -----------
     def Dn(lam, p):        # (N,)
@@ -104,6 +108,8 @@ def social_welfare_maximization(ESP, MDs):
     x0_feas = minimize(
         zero_obj, x0,
         method='trust-constr',
+        jac = '2-point',
+        hess=BFGS(),
         constraints=[nl_eq, nl_ineq],
         options={'verbose': 0, 'xtol':1e-9, 'gtol':1e-9, 'maxiter':2000}
     ).x
@@ -127,7 +133,7 @@ def social_welfare_maximization(ESP, MDs):
         bounds=bounds,
         constraints=cons,
         options={
-        'ftol': 1e-8,
+        'ftol': 1e-9,
         'maxiter': 2000,
         'disp': True
         }
@@ -237,7 +243,8 @@ def optimal_NBP(ESP,MDs):
         md_arg = np.maximum(r - L(p), eps)
         term_esp = w0 * np.log(esp_arg)
         term_md  = np.dot(w, np.log(md_arg))
-        return -(term_esp + term_md)+1*np.linalg.norm(lam,2)          # 最大化 → 取负
+        # return -(term_esp + term_md)          # 最大化 → 取负
+        return -(term_esp + term_md)+0.1*np.linalg.norm(lam,2)          # 最大化 → 取负
 
     # ----------- 约束 -----------
     def Dn(lam, p):        # (N,)
@@ -284,6 +291,8 @@ def optimal_NBP(ESP,MDs):
     x0_feas = minimize(
         zero_obj, x0,
         method='trust-constr',
+        jac = '2-point',
+        hess=BFGS(),
         constraints=[nl_eq, nl_ineq],
         options={'verbose': 0, 'xtol':1e-9, 'gtol':1e-9, 'maxiter':2000}
     ).x
@@ -319,7 +328,7 @@ def optimal_NBP(ESP,MDs):
         bounds=bounds,
         constraints=cons,
         options={
-            'ftol': 1e-8,
+            'ftol': 1e-9,
             'maxiter': 2000,
             'disp': True
         }
