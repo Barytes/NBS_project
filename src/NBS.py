@@ -78,7 +78,7 @@ def solve_MD_subproblem(MDs, rho, last_p, last_lambhat, last_Dhat, lamb, Dmax, a
             delta = md.Fn - pn
             if delta < 0:
                 delta = 0
-        res.append(md.cn*(pn**2) + (md.Fn)**md.kn - (delta)**md.kn)
+        res.append(md.cn*md.s*md.l*(pn**2) + (md.Fn)**md.kn - (delta)**md.kn)
         term_u = np.sum(res)
 
         # ∑  α_i(λ_i-λ̂_i) + ½ρ(λ_i-λ̂_i)²
@@ -114,7 +114,7 @@ def solve_MD_subproblem(MDs, rho, last_p, last_lambhat, last_Dhat, lamb, Dmax, a
         idx_D   = 2*N + i
 
         def lam_upper(x):
-            return  x[idx_p]/(md.s * md.l) - x[idx_lam]-1   # ≥0
+            return  x[idx_p]/(md.s * md.l) - x[idx_lam]-1e-3   # ≥0
         ineq_cons.append({'type': 'ineq', 'fun': lam_upper})
         def Dn_Dh(x):
             return x[idx_D] - md.s/md.Rn-1/(x[idx_p]/(md.s * md.l) - x[idx_lam]+1e-8)  # ≥0

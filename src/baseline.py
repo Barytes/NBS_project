@@ -45,14 +45,7 @@ def social_welfare_maximization(ESP, MDs):
         return lambda0*theta - o / (D0 - Dmax)
 
     def sum_L(p):
-        # return np.sum([md.cn*(pn**2)+(md.Fn)**md.kn-(md.Fn-pn)**md.kn for md, pn in zip(MDs, p)])
-        res = []
-        for md, pn in zip(MDs, p):
-            delta = md.Fn - pn
-            if delta < 0:
-                delta = 0
-            res.append(md.cn*(pn**2) + (md.Fn)**md.kn - (delta)**md.kn)
-        return np.sum(res)
+        return np.sum([md.cn*(pn**2)+(md.Fn)**md.kn-(md.Fn-pn)**md.kn for md, pn in zip(MDs, p)])
 
     def objective(x):
         lam = x[0:N]
@@ -60,17 +53,18 @@ def social_welfare_maximization(ESP, MDs):
         Dm  = x[-1]
         term_esp = Q(Dm)
         term_md  = sum_L(p)
-        return -(term_esp + term_md)/10000         # 最大化 → 取负
+        return -(term_esp + term_md)+1*np.linalg.norm(lam,2)        # 最大化 → 取负
 
     # ----------- 约束 -----------
     def Dn(lam, p):        # (N,)
         Tx = s / R
         Tc = 1.0 / (p / (s * l) - lam)
-        return Tx + Tc
+        return np.asarray(Tx + Tc)
 
     # eq: Σλ = λ0
     def g_eq(x):
-        return np.sum(x[0:N]) - lambda0
+        lam = x[0:N]
+        return np.sum(lam) - lambda0
 
     # ineq list
     def g_ineq(x):
@@ -78,50 +72,54 @@ def social_welfare_maximization(ESP, MDs):
         p   = x[N:2*N]
         Dm  = x[-1]
         res = []
-        res1 = p / (s * l) - lam - 1e-3
-        res2 = F - p
-        res3 = Dm - Dn(lam, p)
-        res4 = D0 - eps - Dm
-        res5 = Q(Dm) - sum_L(p) - eps
-        # print("约束1:", res1)
-        # print("约束2:", res2)
-        # print("约束3:", res3)
-        # print("约束4:", res4)
-        # print("约束5:", res5)
-        res.extend(res1)
-        res.extend(res2)
-        res.extend(res3)
-        res.append(res4)
-        res.append(res5)
-        return np.asarray(res)
-
-    # ----------- 初始可行点 -----------
-    lam0 = np.full(N, lambda0 / N)
-    p0   = F * 0.5
-    Dm0  = 0.5 * D0
-    x0   = np.concatenate([lam0, p0, [Dm0]])
-
-    def feas_obj(x): return np.sum(np.minimum(g_ineq(x), 0)**2) + g_eq(x)**2
-    x0_feas = minimize(feas_obj, x0, method='SLSQP', options={'ftol':1e-9}).x
-    x0_feas = np.nan_to_num(x0_feas)
-
+        res.extend(p / (s * l) - lam - eps)
+        res.extend(F - p)
+        res.extend(Dm - Dn(lam, p)- eps)
+        res.append(D0 - eps - Dm)
+        return res
+    
     # bounds
-    lam_bounds = [(0, lambda0)] * N
+    lam_bounds = [(eps, lambda0)] * N
     p_bounds   = [(eps, Fi) for Fi in F]
     D_bounds   = [(eps, D0 - eps)]
     bounds = lam_bounds + p_bounds + D_bounds
-
-    # print("lam0:", lam0)
-    # print("p0:", p0)
-    # print("Dm0:", Dm0)
-    # print("g_eq(x0):", g_eq(x0))
-    # print("g_ineq(x0):", g_ineq(x0))
-    # print("L(p0):",L(p0))
 
     cons = (
         {'type': 'eq',   'fun': g_eq},
         {'type': 'ineq', 'fun': g_ineq},
     )
+
+    # ----------- 初始可行点 -----------
+    lam0 = np.full(N, lambda0 / N)
+    p0   = F / 2
+    Dm0  = D0 / 2
+    x0   = np.concatenate([lam0, p0, [Dm0]])
+
+    nl_eq   = NonlinearConstraint(g_eq, 0, 0)
+    nl_ineq = NonlinearConstraint(g_ineq, 0, np.inf)
+
+    def zero_obj(x): 
+        return 0.0
+
+    x0_feas = minimize(
+        zero_obj, x0,
+        method='trust-constr',
+        constraints=[nl_eq, nl_ineq],
+        options={'verbose': 0, 'xtol':1e-9, 'gtol':1e-9, 'maxiter':2000}
+    ).x
+
+    # 1. 等式残差
+    heq = np.asarray(g_eq(x0_feas))
+    # 2. 不等式残差
+    hineq = np.asarray(g_ineq(x0_feas))
+    # 3. 判断是否都在容差内
+    tol_eq   = 1e-8
+    tol_ineq = -1e-8  # 小于零一点点可以接受
+    if abs(heq) <= tol_eq and hineq.min() >= tol_ineq:
+        print("✅ 这个点严格满足所有约束（在容差范围内）。")
+    else:
+        print("❌ 约束未全部满足，需要进一步调试或增大可行域容差。")
+        raise ValueError("初始可行点不满足约束条件！")
 
     sol = minimize(
         objective, x0_feas,
@@ -129,33 +127,11 @@ def social_welfare_maximization(ESP, MDs):
         bounds=bounds,
         constraints=cons,
         options={
-        'ftol': 1e-9,
+        'ftol': 1e-8,
         'maxiter': 2000,
         'disp': True
         }
     )
-    # # 等式约束：g_eq(x) == 0
-    # nl_eq = NonlinearConstraint(g_eq, 0.0, 0.0)
-
-    # # 不等式约束：g_ineq(x) >= 0
-    # # （如果你想给上界也加∞，就写 (0, np.inf)）
-    # nl_ineq = NonlinearConstraint(g_ineq, 0.0, np.inf)
-
-    # sol = minimize(
-    #     objective, x0_feas,
-    #     method='trust-constr',
-    #     jac='2-point',
-    #     hess=BFGS(),               # or hess='3-point'
-    #     bounds=bounds,
-    #     constraints=[nl_eq, nl_ineq],
-    #     options={
-    #         'verbose':2,
-    #         'xtol':1e-9,
-    #         'gtol':1e-9,
-    #         'barrier_tol':1e-9,
-    #         'maxiter':20000
-    #     }
-    # )
 
     if sol.status != 0:
         print(f"求解失败：{sol.status} : {sol.message}")
@@ -180,23 +156,16 @@ def solve_r_NBP(ESP, MDs, Dm, lam, p):
         return lambda0*theta - o / (D0 - Dmax)
 
     def L(p_vec):
-        # return np.asarray([md.cn*(pn**2)+(md.Fn)**md.kn-(md.Fn-pn)**md.kn for md, pn in zip(MDs, p)])
-        res = []
-        for md, pn in zip(MDs, p_vec):
-            delta = md.Fn - pn
-            if delta < 0:
-                delta = 0
-            res.append(md.cn*(pn**2) + (md.Fn)**md.kn - (delta)**md.kn)
-        return np.asarray(res)
+        return np.asarray([md.cn*(pn**2)+(md.Fn)**md.kn-(md.Fn-pn)**md.kn for md, pn in zip(MDs, p_vec)])
 
     def objective(x):
         r = x[0:N]
         r = np.nan_to_num(r)  # 确保 r 中没有 NaN
-        esp_arg = max(Q(Dm) - np.sum(r) + eps, eps)
+        esp_arg = np.maximum(Q(Dm) - np.sum(r), eps)
         md_arg = np.maximum(r - L(p) + eps, eps)
         term_esp = w0 * np.log(esp_arg)
         term_md  = np.dot(w, np.log(md_arg))
-        return -(term_esp + term_md)/10000          # 最大化 → 取负
+        return -(term_esp + term_md)          # 最大化 → 取负
 
     # ineq list
     def g_ineq(x):
@@ -217,16 +186,17 @@ def solve_r_NBP(ESP, MDs, Dm, lam, p):
     # bounds
     r_bounds   = [(eps, None)] * N
 
-    # cons = (
-    #     {'type': 'ineq', 'fun': g_ineq}
-    # )
+    cons = (
+        {'type': 'ineq', 'fun': g_ineq}
+    )
 
     sol = minimize(
         objective, x0,
         method='SLSQP',
+        constraints=cons,
         bounds=r_bounds,
         options={
-            'ftol': 1e-9,
+            'ftol': 1e-8,
             'maxiter': 2000,
             'disp': True
         }
@@ -256,25 +226,18 @@ def optimal_NBP(ESP,MDs):
         return lambda0*theta - o / (D0 - Dmax)
 
     def L(p):
-        # return np.asarray([md.cn*(pn**2)+(md.Fn)**md.kn-(md.Fn-pn)**md.kn for md, pn in zip(MDs, p)])
-        res = []
-        for md, pn in zip(MDs, p):
-            delta = md.Fn - pn
-            if delta < 0:
-                delta = 0
-            res.append(md.cn*(pn**2) + (md.Fn)**md.kn - (delta)**md.kn)
-        return np.asarray(res)
+        return np.asarray([md.cn*(pn**2)+(md.Fn)**md.kn-(md.Fn-pn)**md.kn for md, pn in zip(MDs, p)])
 
     def objective(x):
         lam = x[0:N]
         p   = x[N:2*N]
         r   = x[2*N:3*N]
         Dm  = x[-1]
-        esp_arg = max(Q(Dm) - np.sum(r) + eps, eps)
-        md_arg = np.maximum(r - L(p) + eps, eps)
+        esp_arg = np.maximum(Q(Dm) - np.sum(r), eps)
+        md_arg = np.maximum(r - L(p), eps)
         term_esp = w0 * np.log(esp_arg)
         term_md  = np.dot(w, np.log(md_arg))
-        return -(term_esp + term_md)/10000          # 最大化 → 取负
+        return -(term_esp + term_md)+1*np.linalg.norm(lam,2)          # 最大化 → 取负
 
     # ----------- 约束 -----------
     def Dn(lam, p):        # (N,)
@@ -294,7 +257,7 @@ def optimal_NBP(ESP,MDs):
         Dm  = x[-1]
         res = []
         # 12c  λ ≤ p/(s l) - ε
-        res.extend(p / (s * l) - lam - 1e-3)
+        res.extend(p / (s * l) - lam - eps)
         # 12d  p ≤ F_n
         res.extend(F - p)
         # 12e  D_n(λ,p) ≤ D_max
@@ -303,10 +266,6 @@ def optimal_NBP(ESP,MDs):
         res.extend(r)
         # Dm ≤ D0 - ε
         res.append(D0 - eps - Dm)
-        # Q(D_max)−Σr ≥ ε
-        res.append( Q(Dm) - np.sum(r) - eps )
-        # r_n ≥ L_n(p) + ε
-        res.extend( (r - L(p) - eps).tolist() )
         return res
 
     # ----------- 初始可行点 -----------
@@ -316,23 +275,38 @@ def optimal_NBP(ESP,MDs):
     Dm0  = 0.5 * D0
     x0   = np.concatenate([lam0, p0, r0, [Dm0]])
 
-    def feas_obj(x): return np.sum(np.minimum(g_ineq(x), 0)**2) + g_eq(x)**2
-    x0_feas = minimize(feas_obj, x0, method='SLSQP', options={'ftol':1e-9}).x
-    x0_feas = np.nan_to_num(x0_feas)
+    nl_eq   = NonlinearConstraint(g_eq, 0, 0)
+    nl_ineq = NonlinearConstraint(g_ineq, 0, np.inf)
+
+    def zero_obj(x): 
+        return 0.0
+
+    x0_feas = minimize(
+        zero_obj, x0,
+        method='trust-constr',
+        constraints=[nl_eq, nl_ineq],
+        options={'verbose': 0, 'xtol':1e-9, 'gtol':1e-9, 'maxiter':2000}
+    ).x
+
+    # 1. 等式残差
+    heq = np.asarray(g_eq(x0_feas))
+    # 2. 不等式残差
+    hineq = np.asarray(g_ineq(x0_feas))
+    # 3. 判断是否都在容差内
+    tol_eq   = 1e-8
+    tol_ineq = -1e-8  # 小于零一点点可以接受
+    if abs(heq) <= tol_eq and hineq.min() >= tol_ineq:
+        print("✅ 这个点严格满足所有约束（在容差范围内）。")
+    else:
+        print("❌ 约束未全部满足，需要进一步调试或增大可行域容差。")
+        raise ValueError("初始可行点不满足约束条件！")
 
     # bounds
-    lam_bounds = [(0, lambda0)] * N
+    lam_bounds = [(eps, lambda0)] * N
     p_bounds   = [(eps, Fi) for Fi in F]
     r_bounds   = [(eps, None)] * N
     D_bounds   = [(eps, D0 - eps)]
     bounds = lam_bounds + p_bounds + r_bounds + D_bounds
-
-    # print("lam0:", lam0)
-    # print("p0:", p0)
-    # print("r0:", r0)
-    # print("Dm0:", Dm0)
-    # print("g_eq(x0):", g_eq(x0))
-    # print("g_ineq(x0):", g_ineq(x0))
 
     cons = (
         {'type': 'eq',   'fun': g_eq},
@@ -345,33 +319,11 @@ def optimal_NBP(ESP,MDs):
         bounds=bounds,
         constraints=cons,
         options={
-            'ftol': 1e-9,
+            'ftol': 1e-8,
             'maxiter': 2000,
             'disp': True
         }
     )
-
-    # # 等式约束：g_eq(x) == 0
-    # nl_eq = NonlinearConstraint(g_eq, 0.0, 0.0)
-
-    # # 不等式约束：g_ineq(x) >= 0
-    # # （如果你想给上界也加∞，就写 (0, np.inf)）
-    # nl_ineq = NonlinearConstraint(g_ineq, 0.0, 1e10)
-    # sol = minimize(
-    #     objective, x0_feas,
-    #     method='trust-constr',
-    #     jac='2-point',
-    #     hess=BFGS(),               # or hess='3-point'
-    #     bounds=bounds,
-    #     constraints=[nl_eq, nl_ineq],
-    #     options={
-    #         'verbose':2,
-    #         'xtol':1e-9,
-    #         'gtol':1e-9,
-    #         'barrier_tol':1e-9,
-    #         'maxiter':20000
-    #     }
-    # )
 
     if sol.status != 0:
         print(f"求解失败：{sol.status} : {sol.message}")
