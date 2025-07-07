@@ -32,7 +32,7 @@ def solve_ESP_subproblem(ESP, N, rho, last_lamb, last_Dmax, last_p, lamb_hat, Dm
         # 乘子线性项 + 二次罚项
         term_l = alpha.dot(lam - lamb_hat) + (rho/2)*np.sum((lam - lamb_hat)**2)
         term_D = beta.dot(Dmax_arr - Dmax_hat) + (rho/2)*np.sum((Dmax_arr - Dmax_hat)**2)
-        val = term_esp + term_l + term_D + 0.5*1e-4*np.sum(lam**2)
+        val = term_esp + term_l + term_D + 0.1*np.linalg.norm(lam,2)
         if not np.isfinite(val):
             return 1e20   # 给一个大的惩罚值，逼它回到可行域
         return val
@@ -86,7 +86,7 @@ def solve_MD_subproblem(MDs, rho, last_p, last_lambhat, last_Dhat, lamb, Dmax, a
         # ∑  β_i(D - D̂_i) + ½ρ(D-D̂_i)²
         term_D = np.dot(beta, (Dmax_arr - Dh)) + (rho/2)*np.sum((Dmax_arr - Dh)**2)
 
-        val = term_u + term_l + term_D
+        val = term_u + term_l + term_D + 0.1*np.linalg.norm(lamh,2)
         if not np.isfinite(val):
             return 1e20   # 给一个大的惩罚值，逼它回到可行域
         
@@ -107,17 +107,16 @@ def solve_MD_subproblem(MDs, rho, last_p, last_lambhat, last_Dhat, lamb, Dmax, a
         bounds.append((0, None))
 
     for i, md in enumerate(MDs):
-        # 变量索引
-        idx_p   = i
-        idx_lam = N + i
-        idx_D   = 2*N + i
+        idx_p, idx_lam, idx_D = i, N+i, 2*N+i
 
-        def lam_upper(x):
-            return  x[idx_p]/(md.s * md.l) - x[idx_lam]-1e-8   # ≥0
-        ineq_cons.append({'type': 'ineq', 'fun': lam_upper})
-        def Dn_Dh(x):
-            return x[idx_D] - md.s/md.Rn-1/(x[idx_p]/(md.s * md.l) - x[idx_lam]+1e-8)  # ≥0
-        ineq_cons.append({'type': 'ineq', 'fun': Dn_Dh})
+        def lam_upper(x, ip=idx_p, il=idx_lam, m=md):
+            return x[ip]/(m.s*m.l) - x[il] - 1e-8
+        ineq_cons.append({'type':'ineq', 'fun': lam_upper})
+
+        def Dn_Dh(x, ip=idx_p, il=idx_lam, idd=idx_D, m=md):
+            denom = x[ip]/(m.s*m.l) - x[il] + 1e-8
+            return x[idd] - m.s/m.Rn - 1/denom
+        ineq_cons.append({'type':'ineq', 'fun': Dn_Dh})
 
     # SLSQP 求解
     sol = minimize(
@@ -193,13 +192,13 @@ def ADMM(ESP,MDs):
         elif np.linalg.norm(s,2) > mu*np.linalg.norm(r,2):
             rho /= tau
 
-        print(" iter", t,
-        "||lam-lam_hat||=", np.linalg.norm(lamb-lamb_hat),
-        "||Dmax-Dmax_hat||=", np.linalg.norm(Dmax-Dmax_hat),
-        "||r||=", np.linalg.norm(r,2),
-        "||s||=", np.linalg.norm(s,2),
-        "  alpha=", alpha,
-        "  beta=", beta)
+        # print(" iter", t,
+        # "||lam-lam_hat||=", np.linalg.norm(lamb-lamb_hat),
+        # "||Dmax-Dmax_hat||=", np.linalg.norm(Dmax-Dmax_hat),
+        # "||r||=", np.linalg.norm(r,2),
+        # "||s||=", np.linalg.norm(s,2),
+        # "  alpha=", alpha,
+        # "  beta=", beta)
         
         t += 1
 
