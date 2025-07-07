@@ -28,10 +28,12 @@ class MD:
         return self.s/self.Rn
     
     def compute_delay(self,pn,lambdan):
+        if lambdan < 1e-3: return 0
         if pn/(self.s*self.l)<lambdan-1e-3: return None
         return 1/(pn/(self.s*self.l)-lambdan)
     
     def delay(self,pn,lambdan):
+        if lambdan < 1e-3: return 0
         if pn/(self.s*self.l)<lambdan-1e-3: return None
         return self.s/self.Rn + 1/(pn/(self.s*self.l)-lambdan)
     

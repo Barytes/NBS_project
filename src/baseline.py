@@ -3,37 +3,155 @@ import numpy as np
 from scipy.optimize import minimize, NonlinearConstraint
 from scipy.optimize._hessian_update_strategy import BFGS
 
-def uniform_baseline(ESP, MDs):
+def uniform_baseline(ESP, MDs,seed=None):
     N = len(MDs)
     D0  = ESP.D0
     lambda0 = ESP.lambda0
     theta = ESP.theta
     o = ESP.o
-    w0 = ESP.omega_0
-    w = [md.omega_n for md in MDs]
+    s, l = MDs[0].s, MDs[0].l  # 所有MD的s和l相同
+    R = np.array([md.Rn for md in MDs])  # (N,)
+    rng = np.random.default_rng(seed)
+
+    lam_uni = np.full(N, lambda0 / N)  # 均匀分配 λ
+    basic_p = [min(lam_uni[i]*s*l+s*l/(D0-s/R[i]),md.Fn) for i,md in enumerate(MDs)] 
+    p_uni = [basic_p[i]+rng.uniform(0,(md.Fn-basic_p[i])) for i,md in enumerate(MDs)]
+    Dmax = max([md.delay(p_uni[i], lam_uni[i]) for i, md in enumerate(MDs)])
+    Q = lambda0 * theta - o / (D0 - Dmax)
+    sum_L = np.sum([md.Ln(p_uni[i]) for i, md in enumerate(MDs)])
+    r_uni = [np.maximum(Q - sum_L, 0) / N for md in MDs]  # 均匀分配 r
+    return lam_uni, p_uni, r_uni, Dmax
+
+def proportional_baseline(ESP,MDs):
+    sum_F = np.sum([md.Fn for md in MDs])
+    proportion = np.array([md.Fn/sum_F for md in MDs])
+    lamb = proportion * ESP.lambda0
+    p = np.array([md.Fn for md in MDs])  # 均匀分配 p
+    Dmax = max([md.delay(p[i], lamb[i]) for i, md in enumerate(MDs)])
+    Q = ESP.lambda0 * ESP.theta - ESP.o / (ESP.D0 - Dmax)
+    sum_L = np.sum([md.Ln(p[i]) for i, md in enumerate(MDs)])
+    r = np.maximum(Q - sum_L, 0) * proportion  # 均匀分配 r
+    return lamb, p, r, Dmax
+
+def non_cooperative_baseline(ESP,MDs):
+    N = len(MDs)
+    D0  = ESP.D0
+    lambda0 = ESP.lambda0
+    theta = ESP.theta
+    o = ESP.o
     eps = 1e-6
     F = np.array([md.Fn for md in MDs])  # (N,)
     s, l = MDs[0].s, MDs[0].l  # 所有MD的s和l相同
     R = np.array([md.Rn for md in MDs])  # (N,)
 
-    lam_opt = np.full(N, lambda0 / N)  # 均匀分配 λ
+    # ----------- 目标函数 -----------
+    def Q(Dmax):
+        return lambda0*theta - o / (D0 - Dmax)
+
+    def L(p):
+        for i,md in enumerate(MDs):
+            if p[i] < 0: p[i] = eps
+            elif p[i] > md.Fn: p[i] = md.Fn - eps
+        return [md.cn*(pn**2)+(md.Fn)**md.kn-(md.Fn-pn)**md.kn for md, pn in zip(MDs, p)]
     
+    def p_star(lamb,Dmax):
+        return [lamb[i]*s*l+s*l/(Dmax-s/R[i]) for i, md in enumerate(MDs)]
+
+    def objective(x):
+        lam = x[0:N]
+        r   = x[N:2*N]
+        Dm  = x[-1]
+        return -Q(Dm)+np.sum(r)
+        # return -Q(Dm)+np.sum(r)+0.1*np.linalg.norm(lam,2)
+
+    # ----------- 约束 -----------
+    # eq: Σλ = λ0
+    def g_eq(x):
+        lam = x[0:N]
+        return np.sum(lam) - lambda0
+
+    # ineq list
+    def g_ineq(x):
+        lam = x[0:N]
+        r   = x[N:2*N]
+        Dm  = x[-1]
+        p_s = p_star(lam,Dm)
+        res = []
+        res.extend(r - L(p_s))
+        res.extend(F - p_s)
+        res.append(D0 - eps - Dm)
+        return res
     
+    # bounds
+    lam_bounds = [(0, lambda0)] * N
+    r_bounds   = [(0, lambda0*theta)] * N
+    max_trans_delay = max([s/md.Rn for md in MDs])
+    D_bounds   = [(max_trans_delay+eps, D0 - eps)]
+    bounds = lam_bounds + r_bounds + D_bounds
+
+    cons = (
+        {'type': 'eq',   'fun': g_eq},
+        {'type': 'ineq', 'fun': g_ineq},
+    )
+
+    # ----------- 初始可行点 -----------
+    lam0 = np.full(N, lambda0 / N)
+    r0   = np.full(N, 0.01)
+    Dm0  = D0 / 2
+    x0   = np.concatenate([lam0, r0, [Dm0]])
+
+    nl_eq   = NonlinearConstraint(g_eq, 0, 0)
+    nl_ineq = NonlinearConstraint(g_ineq, 0, np.inf)
+
+    def zero_obj(x): 
+        return 0.0
+
+    x0_feas = minimize(
+        zero_obj, x0,
+        method='trust-constr',
+        jac = '2-point',
+        hess=BFGS(),
+        constraints=[nl_eq, nl_ineq],
+        options={'verbose': 0, 'xtol':1e-9, 'gtol':1e-9, 'maxiter':2000}
+    ).x
+
+    # 1. 等式残差
+    heq = np.asarray(g_eq(x0_feas))
+    # 2. 不等式残差
+    hineq = np.asarray(g_ineq(x0_feas))
+    # 3. 判断是否都在容差内
+    tol_eq   = 1e-8
+    tol_ineq = -1e-8  # 小于零一点点可以接受
+    if abs(heq) <= tol_eq and hineq.min() >= tol_ineq:
+        print("✅ 这个点严格满足所有约束（在容差范围内）。")
+    else:
+        print("❌ 约束未全部满足，需要进一步调试或增大可行域容差。")
+        raise ValueError("初始可行点不满足约束条件！")
+
+    sol = minimize(
+        objective, x0_feas,
+        method='SLSQP',
+        bounds=bounds,
+        constraints=cons,
+        options={
+        'ftol': 1e-9,
+        'maxiter': 2000,
+        'disp': True
+        }
+    )
+
+    if sol.status != 0:
+        print(f"求解失败：{sol.status} : {sol.message}")
+
+    lam_opt = sol.x[0:N]
+    r_opt   = sol.x[N:2*N]
+    Dmax    = sol.x[-1]
+    p_opt = p_star(lam_opt, Dmax)
+    for i, md in enumerate(MDs):
+        pn = lam_opt[i]*s*l+s*l/(Dmax-s/R[i])
+        if lam_opt[i]<=1e-2: pn = 0
+        p_opt[i] = pn
     return lam_opt, p_opt, r_opt, Dmax
-
-def proportional_baseline(ESP,MDs):
-    N = len(MDs)
-    s, l = MDs[0].s, MDs[0].l
-    sum_F = np.sum([md.Fn for md in MDs])
-    proportion = np.array([md.Fn/sum_F for md in MDs])
-    lamb = proportion * ESP.lambda0
-    p = lamb*s*l+1e7
-    # solve NBP problem for r
-    pass
-    return
-
-def non_cooperative_baseline(ESP,MDs):
-    pass
 
 def contract_baseline(ESP,MDs):
     pass
