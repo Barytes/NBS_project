@@ -5,12 +5,21 @@ from scipy.optimize._hessian_update_strategy import BFGS
 
 def uniform_baseline(ESP, MDs):
     N = len(MDs)
-    lambda_n = ESP.lambda0/N
-    s, l = MDs[0].s, MDs[0].l
-    pn = lambda_n*s*l+1e7
-    # solve NBP problem for r
-    pass
-    return
+    D0  = ESP.D0
+    lambda0 = ESP.lambda0
+    theta = ESP.theta
+    o = ESP.o
+    w0 = ESP.omega_0
+    w = [md.omega_n for md in MDs]
+    eps = 1e-6
+    F = np.array([md.Fn for md in MDs])  # (N,)
+    s, l = MDs[0].s, MDs[0].l  # 所有MD的s和l相同
+    R = np.array([md.Rn for md in MDs])  # (N,)
+
+    lam_opt = np.full(N, lambda0 / N)  # 均匀分配 λ
+    
+    
+    return lam_opt, p_opt, r_opt, Dmax
 
 def proportional_baseline(ESP,MDs):
     N = len(MDs)
