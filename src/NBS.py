@@ -90,7 +90,7 @@ def solve_MD_subproblem(MDs, rho, last_p, last_lambhat, last_Dhat, lamb, Dmax, a
         if not np.isfinite(val):
             return 1e20   # 给一个大的惩罚值，逼它回到可行域
         
-        return val
+        return val/10
 
     # ---- 约束与边界 ----
     bounds = []
