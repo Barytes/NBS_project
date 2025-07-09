@@ -50,6 +50,24 @@ def non_cooperative_baseline(ESP,MDs):
     k = np.array([md.kn for md in MDs])
     bigM     = 1e20                    # 惩罚
 
+    if lambda0*s*l<=np.max([md.Fn for md in MDs]):
+        raise ValueError(f"λ0={lambda0} already exceeds physical limit {lambda_cap:.2f}")
+
+def non_cooperative_baseline1(ESP,MDs):
+    # ----------------- 固定参数 ----------------- #
+    N = len(MDs)
+    D0  = ESP.D0
+    lambda0 = ESP.lambda0
+    theta = ESP.theta
+    o = ESP.o
+    eps = 1e-5
+    F = np.array([md.Fn for md in MDs])  # (N,)
+    s, l = MDs[0].s, MDs[0].l  # 所有MD的s和l相同
+    R = np.array([md.Rn for md in MDs])  # (N,)
+    c = np.array([md.cn for md in MDs])
+    k = np.array([md.kn for md in MDs])
+    bigM     = 1e20                    # 惩罚
+
     D_cap = D0 - 1e-3
     lambda_cap = np.sum(np.maximum(0, F/(s*l) - 1/(D_cap - s/R)))
     if lambda_cap < lambda0:
@@ -72,7 +90,7 @@ def non_cooperative_baseline(ESP,MDs):
         p_lo = s*l*lam + s*l/(Dmax - s/R[idx])      # 时延下界
         if p_lo > F[idx]:                # 不可行
             print(f"p_lo > F[idx]: MD {idx} : {p_lo}>{F[idx]}")
-            return 0.0
+            return None
 
         # 目标: 取负号 → 转成最小化
         def negU(p):
@@ -84,7 +102,7 @@ def non_cooperative_baseline(ESP,MDs):
         if res.status != 0:
             print(f"p_star 求解失败：{res.status} : {res.message}")
         p_s = res.x
-        if pi*p_s - c[idx]*p_s**2 - (F[idx])**k[idx] + (F[idx]-p_s)**k[idx] <= 0: return 0.0
+        if pi*p_s - c[idx]*p_s**2 - (F[idx])**k[idx] + (F[idx]-p_s)**k[idx] <= 0: return None
         return res.x
 
     # ----------------- 待优化目标 ----------------- #
@@ -113,7 +131,7 @@ def non_cooperative_baseline(ESP,MDs):
         p = np.asarray([p_star(pi,lam[i],Dmax,i) for i,md in enumerate(MDs)])
         res.extend(F - (s*l*lam + s*l/(Dmax - s/R))-1e-3)
         res.extend((Dmax - s/R) - 1e-3)
-        res.extend(pi*p - L(p)) 
+        # res.extend(pi*p - L(p)) 
         return res  # element-wise
 
     cons = [
@@ -121,17 +139,18 @@ def non_cooperative_baseline(ESP,MDs):
         {'type': 'ineq', 'fun': g_ineq},      # Dmax ≥ s/R + ε, slλ + sl/(Dmax-s/R) ≤ F
     ]
 
-    pi_bound = [(0,None)]
-    lam_bounds = [(0, None)]*N
     Dmin = np.max(s/R) + eps
+    pi_bound = [(0,None)]
+    # lam_bounds = [(0, None)]*N
+    lam_bounds = [(0, F[i]/(s*l) - 1/(Dmin - s/R[i]) - 1e-3) for i in range(N)]
     D_bounds   = [(Dmin, D0 - eps)]
     bounds = pi_bound + lam_bounds + D_bounds
 
     # ----------------- 初始猜测 ----------------- #
     x0 = np.zeros(N+2)
     x0[0]   = 0.1                       # π
-    x0[1:-1]= lambda0/N
-    x0[-1]  = 0.5*(Dmin+D0-eps)
+    x0[1:-1]= 0.8 * lambda0 / N
+    x0[-1]  = 0.8*(Dmin+D0-eps)
 
     nl_eq   = NonlinearConstraint(g_eq, 0, 0)
     nl_ineq = NonlinearConstraint(g_ineq, 0, np.inf)
@@ -160,11 +179,11 @@ def non_cooperative_baseline(ESP,MDs):
         print("✅ 这个点严格满足所有约束（在容差范围内）。")
     else:
         print("❌ 约束未全部满足，需要进一步调试或增大可行域容差。")
-        raise ValueError("初始可行点不满足约束条件！")
+        # raise ValueError("初始可行点不满足约束条件！")
 
     # ----------------- 求解 ----------------- #
     sol = minimize(
-        objective, x0_feas,
+        objective, x0,
         method='trust-constr',
         jac = '2-point',
         hess=BFGS(),
