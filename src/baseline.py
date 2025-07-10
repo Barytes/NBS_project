@@ -1,6 +1,6 @@
 # src/baseline.py()
 import numpy as np
-from scipy.optimize import minimize, NonlinearConstraint, minimize_scalar
+from scipy.optimize import minimize, NonlinearConstraint, LinearConstraint
 from scipy.optimize._hessian_update_strategy import BFGS
 
 def uniform_baseline(ESP, MDs,seed=None):
@@ -37,174 +37,154 @@ def proportional_baseline(ESP,MDs,seed=None):
 
 def non_cooperative_baseline(ESP,MDs):
     # ----------------- 固定参数 ----------------- #
-    N = len(MDs)
+
+    N   = len(MDs)
+    s,l = MDs[0].s, MDs[0].l
+    R   = np.array([m.Rn for m in MDs])
+    F   = np.array([m.Fn for m in MDs])
+    c   = np.array([m.cn for m in MDs])
+    k   = np.array([m.kn for m in MDs])
+    sR = s / R
+    sl = s * l
     D0  = ESP.D0
     lambda0 = ESP.lambda0
     theta = ESP.theta
     o = ESP.o
     eps = 1e-5
-    F = np.array([md.Fn for md in MDs])  # (N,)
-    s, l = MDs[0].s, MDs[0].l  # 所有MD的s和l相同
-    R = np.array([md.Rn for md in MDs])  # (N,)
-    c = np.array([md.cn for md in MDs])
-    k = np.array([md.kn for md in MDs])
     bigM     = 1e20                    # 惩罚
 
-    if lambda0*s*l<=np.max([md.Fn for md in MDs]):
-        raise ValueError(f"λ0={lambda0} already exceeds physical limit {lambda_cap:.2f}")
-
-def non_cooperative_baseline1(ESP,MDs):
-    # ----------------- 固定参数 ----------------- #
-    N = len(MDs)
-    D0  = ESP.D0
-    lambda0 = ESP.lambda0
-    theta = ESP.theta
-    o = ESP.o
-    eps = 1e-5
-    F = np.array([md.Fn for md in MDs])  # (N,)
-    s, l = MDs[0].s, MDs[0].l  # 所有MD的s和l相同
-    R = np.array([md.Rn for md in MDs])  # (N,)
-    c = np.array([md.cn for md in MDs])
-    k = np.array([md.kn for md in MDs])
-    bigM     = 1e20                    # 惩罚
-
-    D_cap = D0 - 1e-3
-    lambda_cap = np.sum(np.maximum(0, F/(s*l) - 1/(D_cap - s/R)))
-    if lambda_cap < lambda0:
-        raise ValueError(f"λ0={lambda0} already exceeds physical limit {lambda_cap:.2f}")
-
-    def Q(Dmax):                       # ESP 收益
-        return lambda0*theta - o/(D0-Dmax)
+    if lambda0*s*l>np.max([md.Fn for md in MDs]):
+        raise ValueError(f"λ0={lambda0} already exceeds physical limit {np.max([md.Fn for md in MDs])/(s*l):.2f}")
     
-    def L(p):
-        L = np.zeros(N)
-        for i,md in enumerate(MDs):
-            if p[i] is None or p[i]>md.Fn:                       # 不可行 → 重罚
-                L[i] = bigM
-            else:
-                L[i] = md.cn*(p[i]**2)+(md.Fn)**md.kn-(md.Fn-p[i])**md.kn
-        return L
+    Dmin = np.max(s/R) + 1e-3
 
-    # ----------------- follower best response ----------------- #
-    def p_star(pi, lam, Dmax, idx):
-        p_lo = s*l*lam + s*l/(Dmax - s/R[idx])      # 时延下界
-        if p_lo > F[idx]:                # 不可行
-            print(f"p_lo > F[idx]: MD {idx} : {p_lo}>{F[idx]}")
-            return None
+    def Q(Dmax):
+        return  lambda0*theta - o/(D0 - Dmax)
 
-        # 目标: 取负号 → 转成最小化
-        def negU(p):
-            return -(pi*p - c[idx]*p**2 + (F[idx]-p)**k[idx])
-
-        res = minimize_scalar(
-                negU, bounds=(p_lo, F[idx]-eps), method='bounded',
-                options={'xatol':1e-8})
-        if res.status != 0:
-            print(f"p_star 求解失败：{res.status} : {res.message}")
-        p_s = res.x
-        if pi*p_s - c[idx]*p_s**2 - (F[idx])**k[idx] + (F[idx]-p_s)**k[idx] <= 0: return None
-        return res.x
-
-    # ----------------- 待优化目标 ----------------- #
-    def objective(x):
-        pi   = x[0]
-        lam  = x[1:-1]
-        Dmax = x[-1]
-
-        p_sum = 0.0
-        for n in range(N):
-            p_n = p_star(pi, lam[n], Dmax, n)
-            if p_n is None:                       # 不可行 → 重罚
-                return bigM
-            p_sum += p_n
-        return -(Q(Dmax) - pi*p_sum)              # SLSQP 最小化
-
-    # ----------------- 约束与边界 ----------------- #
-    def g_eq(x):      # Σλ = λ0
-        return np.sum(x[1:-1]) - lambda0
+    def L_i(i, p):
+        return c[i]*p**2 + F[i]**k[i] - (F[i]-p)**k[i]
     
-    def g_ineq(x):
-        pi   = x[0]
-        lam  = x[1:-1]            # λ₁…λ_N
-        Dmax = x[-1]
+    def g_i(i, p, pi):
+        """stationarity residual  g_i=∂U/∂p"""
+        return pi - 2*c[i]*p - k[i]*(F[i]-p)**(k[i]-1)
+    
+    def pmin_i(i, lam_i, Dmax):
+        return sl*lam_i + sl/(Dmax - sR[i])
+    
+    def sgap_i(i, p, pi):
+        return pi*p - L_i(i, p)
+
+    def phi_mu(a,b, mu):
+        return np.sqrt(a*a + b*b + mu*mu) - a - b
+    
+    # ---------- 4.  decision vector packing / unpacking ----------
+    # z = [pi | lam( N ) | Dmax | p( N ) | alpha( N ) | beta( N ) | s_gap( N )]
+    idx_pi = 0
+    idx_lam = slice(1, 1+N)
+    idx_D   = 1 + N
+    idx_p   = slice(2+N, 2+2*N)
+    idx_al  = slice(2+2*N, 2+3*N)
+    idx_be  = slice(2+3*N, 2+4*N)
+    # idx_sg  = slice(2+4*N, 2+5*N)
+
+    # dim = 2 + 5*N          # total length of z
+    dim = 2 + 4*N          # total length of z
+
+    def unpack(z):
+        pi   = z[idx_pi]
+        lam  = z[idx_lam]
+        Dmax = z[idx_D]
+        p    = z[idx_p]
+        alpha= z[idx_al]
+        beta = z[idx_be]
+        # sgap = z[idx_sg]
+        return pi, lam, Dmax, p, alpha, beta
+        # return pi, lam, Dmax, p, alpha, beta, sgap
+
+    # ---------- 5.  outer continuation parameters ----------
+    outer_max_iter = 4
+    mu0  = 1e-2
+    rho0 = 1e2
+
+    # ---------- 6.  bounds & equality constraint ----------
+    bounds = [(0, None)]                   # pi>=0
+    bounds += [(0, lambda0)]*N                # λ
+    bounds += [(Dmin, ESP.D0-1e-3)]        # Dmax
+    bounds += [(0, F[i]) for i in range(N)] # p
+    bounds += [(0, None)]*N                # alpha
+    bounds += [(0, None)]*N                # beta
+    # bounds += [(None, None)]*N             # s_gap  (free)
+
+    def cons_lamsum(z):
+        return np.sum(z[idx_lam]) - ESP.lambda0
+    
+    def g_ineq(z):
         res = []
-        p = np.asarray([p_star(pi,lam[i],Dmax,i) for i,md in enumerate(MDs)])
-        res.extend(F - (s*l*lam + s*l/(Dmax - s/R))-1e-3)
-        res.extend((Dmax - s/R) - 1e-3)
-        # res.extend(pi*p - L(p)) 
-        return res  # element-wise
+        res.extend(F - z[idx_lam]*sl-sl/(z[idx_D]-sR)-1e-3)
+        res.extend(z[idx_p] - z[idx_lam]*sl-sl/(z[idx_D]-sR)-1e-3)
+        res.extend(z[idx_p] - z[idx_lam]*sl - 1e-3)
+        return res
 
-    cons = [
-        {'type': 'eq',   'fun': g_eq},  # Σλ = λ0
-        {'type': 'ineq', 'fun': g_ineq},      # Dmax ≥ s/R + ε, slλ + sl/(Dmax-s/R) ≤ F
-    ]
+    eq_cons = {'type': 'eq', 'fun': cons_lamsum}
+    ineq_cons = {'type': 'ineq', 'fun': g_ineq}
 
-    Dmin = np.max(s/R) + eps
-    pi_bound = [(0,None)]
-    # lam_bounds = [(0, None)]*N
-    lam_bounds = [(0, F[i]/(s*l) - 1/(Dmin - s/R[i]) - 1e-3) for i in range(N)]
-    D_bounds   = [(Dmin, D0 - eps)]
-    bounds = pi_bound + lam_bounds + D_bounds
+    # ---------- 7.  outer loop ----------
+    #  initial guess
+    lam0  = np.full(N, ESP.lambda0/N)
+    p0    = np.minimum(F/2, 0.5)           # any positive
+    z = np.zeros(dim)
+    z[idx_pi]  = 1.0
+    z[idx_lam] = lam0
+    z[idx_D]   = 0.5*(Dmin+ESP.D0)
+    z[idx_p]   = p0
+    # z[idx_sg]  = -1.0                       # initial gap
 
-    # ----------------- 初始猜测 ----------------- #
-    x0 = np.zeros(N+2)
-    x0[0]   = 0.1                       # π
-    x0[1:-1]= 0.8 * lambda0 / N
-    x0[-1]  = 0.8*(Dmin+D0-eps)
+    for it in range(outer_max_iter):
+        mu  = mu0  * (0.8  ** it)
+        rho = rho0 * (1.3 ** it)
+        print(f"\n--- Outer iter {it}: mu={mu:g}, rho={rho:g} ---")
+        # --- objective ---
+        def obj(zvec):
+            pi, lam, Dmax, p, al, be = unpack(zvec)
+            leader_part = -(Q(Dmax) - pi*np.sum(p))
+            pen = 0.0
+            for i in range(N):
+                g   = g_i(i, p[i], pi)
+                a   = p[i] - pmin_i(i, lam[i], Dmax)
+                b   = F[i] - p[i]
+                pen += g**2 \
+                    + phi_mu(a,  al[i], mu)**2 \
+                    + phi_mu(b,  be[i], mu)**2 \
+                    + phi_mu(p[i], -sgap_i(i,p[i],pi), mu)**2
+            return leader_part + rho*pen
+        # --- solve NLP ---
+        # res = minimize(obj, z, method='trust-constr',
+        #             constraints=[eq_cons, ineq_cons],
+        #             bounds=bounds,
+        #             options={'gtol':1e-8,'xtol':1e-8,'maxiter':2000,'verbose':0})
+        res = minimize(obj, z, method='SLSQP',
+                bounds=bounds, constraints=[eq_cons, ineq_cons],
+                options={'ftol':1e-9, 'maxiter':2000,'disp':True})
+        if not res.success:
+            print("  NLP failed:", res.message)
+            # break
+        z = res.x
+        print("  inner NLP status =", res.message)
+        # gap = np.max(np.abs(res.grad[idx_p]))       # crude gap measure
+        # print("  inner NLP status =", res.message, " | max grad p =", gap)
+        # if gap < 1e-5:
+        #     break
 
-    nl_eq   = NonlinearConstraint(g_eq, 0, 0)
-    nl_ineq = NonlinearConstraint(g_ineq, 0, np.inf)
-
-    def zero_obj(x): 
-        return 0.0
-
-    x0_feas = minimize(
-        zero_obj, x0,
-        method='trust-constr',
-        jac = '2-point',
-        hess=BFGS(),
-        constraints=[nl_eq, nl_ineq],
-        bounds=bounds,
-        options={'verbose': 0, 'xtol':1e-9, 'gtol':1e-9, 'maxiter':2000}
-    ).x
-
-    # 1. 等式残差
-    heq = np.asarray(g_eq(x0_feas))
-    # 2. 不等式残差
-    hineq = np.asarray(g_ineq(x0_feas))
-    # 3. 判断是否都在容差内
-    tol_eq   = 1e-8
-    tol_ineq = -1e-8  # 小于零一点点可以接受
-    if abs(heq) <= tol_eq and hineq.min() >= tol_ineq:
-        print("✅ 这个点严格满足所有约束（在容差范围内）。")
-    else:
-        print("❌ 约束未全部满足，需要进一步调试或增大可行域容差。")
-        # raise ValueError("初始可行点不满足约束条件！")
-
-    # ----------------- 求解 ----------------- #
-    sol = minimize(
-        objective, x0,
-        method='trust-constr',
-        jac = '2-point',
-        hess=BFGS(),
-        constraints=[nl_eq, nl_ineq],
-        bounds=bounds,
-        options={'verbose': 0, 'xtol':1e-9, 'gtol':1e-9, 'maxiter':2000}
-    )
-    
-    # sol = minimize(objective, x0_feas, method='SLSQP',
-    #             bounds=bounds, constraints=cons,
-    #             options={'ftol':1e-9, 'maxiter':2000,'disp':True})
-
-    if sol.status != 0:
-        print(f"ESP leader 求解失败：{sol.status} : {sol.message}")
-
-    pi_opt   = sol.x[0]
-    lam_opt  = sol.x[1:-1]
-    D_opt    = sol.x[-1]
-    p_opt    = np.array([p_star(pi_opt, lam_opt[i], D_opt, i) for i in range(N)])
-    print(lam_opt, p_opt, pi_opt, D_opt)
-    return lam_opt, p_opt, pi_opt*p_opt, D_opt
+    # ---------- 8.  extract solution ----------
+    pi, lam, Dmax, p, *_ = unpack(z)
+    print("\n===  Final solution  ===")
+    print("pi =", pi)
+    print("lambda =", lam)
+    print("p =", p)
+    print("Dmax =", Dmax)
+    print("IR gaps  =", [sgap_i(i,p[i],pi) for i in range(N)])
+    print("sum lambda (should=λ0) =", lam.sum())
+    return lam, p, pi*p, Dmax
 
 def contract_baseline(ESP,MDs):
     N = len(MDs)
@@ -212,8 +192,6 @@ def contract_baseline(ESP,MDs):
     lambda0 = ESP.lambda0
     theta = ESP.theta
     o = ESP.o
-    w0 = ESP.omega_0
-    w = [md.omega_n for md in MDs]
     eps = 1e-6
     F = np.array([md.Fn for md in MDs])  # (N,)
     s, l = MDs[0].s, MDs[0].l  # 所有MD的s和l相同
@@ -238,11 +216,19 @@ def contract_baseline(ESP,MDs):
         Tx = s / R
         Tc = 1.0 / (p / (s * l) - lam)
         return Tx + Tc
+    
+    def max_Dn_smooth(lam, p, gamma=30.0):
+        Dvec = Dn(lam, p)           # (N,)
+        return (1.0/gamma) * np.log(np.sum(np.exp(gamma * Dvec)))
 
     # eq: Σλ = λ0
     def g_eq(x):
         return np.sum(x[0:N]) - lambda0
-
+    
+    def g_tight(x):
+        lam = x[0:N]; p = x[N:2*N]; Dm = x[-1]
+        return (Dm - max_Dn_smooth(lam,p))*100
+    
     # ineq list
     def g_ineq(x):
         lam = x[0:N]
@@ -265,22 +251,21 @@ def contract_baseline(ESP,MDs):
         for i, md_i in enumerate(MDs):
             # 计算 md_i 的成本函数对任意 p 的值
             def L_i(p_val):
-                if p_val < 0: p[i] = eps
-                elif p_val > md_i.Fn: p_val = md_i.Fn - eps
+                if p_val < 0: return 1e20
+                elif p_val > md_i.Fn: return 1e20
                 return md_i.cn * p_val**2 + md_i.Fn**md_i.kn - (md_i.Fn - p_val)**md_i.kn
             for j, md_j in enumerate(MDs):
                 if i == j:
                     continue
                 # 左侧： r_i - L_i(p_i) - (r_j - L_i(p_j))
-                res.append((r[i] - L_i(p[i])) - (r[j] - L_i(p[j]))-eps)
-
+                res.append((r[i] - L_i(p[i])) - (r[j] - L_i(p[j])))
         return res
     
     # bounds
-    lam_bounds = [(eps, lambda0)] * N
-    p_bounds   = [(eps, Fi) for Fi in F]
-    r_bounds   = [(eps, None)] * N
-    D_bounds   = [(eps, D0 - eps)]
+    lam_bounds = [(0, lambda0)] * N
+    p_bounds   = [(0, Fi) for Fi in F]
+    r_bounds   = [(0, None)] * N
+    D_bounds   = [(0, D0 - eps)]
     bounds = lam_bounds + p_bounds + r_bounds + D_bounds
 
     # ----------- 初始可行点 -----------
@@ -292,48 +277,60 @@ def contract_baseline(ESP,MDs):
 
     nl_eq   = NonlinearConstraint(g_eq, 0, 0)
     nl_ineq = NonlinearConstraint(g_ineq, 0, np.inf)
+    nl_eq_tight = NonlinearConstraint(g_tight, 0, 0)
+    constraints=[nl_eq, nl_ineq, nl_eq_tight]
 
-    def zero_obj(x): 
-        return 0.0
+    # def zero_obj(x): 
+    #     return 0.0
 
-    x0_feas = minimize(
-        zero_obj, x0,
+    # x0_feas = minimize(
+    #     zero_obj, x0,
+    #     method='trust-constr',
+    #     jac = '2-point',
+    #     hess=BFGS(),
+    #     constraints=[nl_eq, nl_ineq],
+    #     bounds=bounds,
+    #     options={'verbose': 0, 'xtol':1e-9, 'gtol':1e-9, 'maxiter':2000}
+    # ).x
+
+    # # 1. 等式残差
+    # heq = np.asarray(g_eq(x0_feas))
+    # # 2. 不等式残差
+    # hineq = np.asarray(g_ineq(x0_feas))
+    # # 3. 判断是否都在容差内
+    # tol_eq   = 1e-6
+    # tol_ineq = -1e-6  # 小于零一点点可以接受
+    # if abs(heq) <= tol_eq and hineq.min() >= tol_ineq:
+    #     print("✅ 这个点严格满足所有约束（在容差范围内）。")
+    # else:
+    #     print("❌ 约束未全部满足，需要进一步调试或增大可行域容差。")
+        # raise ValueError("初始可行点不满足约束条件！")
+
+    # cons = (
+    #     {'type': 'eq',   'fun': g_eq},
+    #     {'type': 'ineq', 'fun': g_ineq},
+    # )
+
+    # sol = minimize(
+    #     objective, x0,
+    #     method='SLSQP',
+    #     bounds=bounds,
+    #     constraints=cons,
+    #     options={
+    #         'ftol': 1e-9,
+    #         'maxiter': 2000,
+    #         'disp': True
+    #     }
+    # )
+
+    sol = minimize(
+        objective, x0,
         method='trust-constr',
         jac = '2-point',
         hess=BFGS(),
-        constraints=[nl_eq, nl_ineq],
+        constraints=constraints,
         bounds=bounds,
         options={'verbose': 0, 'xtol':1e-9, 'gtol':1e-9, 'maxiter':2000}
-    ).x
-
-    # 1. 等式残差
-    heq = np.asarray(g_eq(x0_feas))
-    # 2. 不等式残差
-    hineq = np.asarray(g_ineq(x0_feas))
-    # 3. 判断是否都在容差内
-    tol_eq   = 1e-6
-    tol_ineq = -1e-6  # 小于零一点点可以接受
-    if abs(heq) <= tol_eq and hineq.min() >= tol_ineq:
-        print("✅ 这个点严格满足所有约束（在容差范围内）。")
-    else:
-        print("❌ 约束未全部满足，需要进一步调试或增大可行域容差。")
-        # raise ValueError("初始可行点不满足约束条件！")
-
-    cons = (
-        {'type': 'eq',   'fun': g_eq},
-        {'type': 'ineq', 'fun': g_ineq},
-    )
-
-    sol = minimize(
-        objective, x0_feas,
-        method='SLSQP',
-        bounds=bounds,
-        constraints=cons,
-        options={
-            'ftol': 1e-9,
-            'maxiter': 2000,
-            'disp': True
-        }
     )
 
     if sol.status != 0:

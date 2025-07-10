@@ -60,7 +60,7 @@ def solve_ESP_subproblem(ESP, N, rho, last_lamb, last_Dmax, last_p, lamb_hat, Dm
     Dmax = sol.x[N]
     return lamb, Dmax
 
-def solve_MD_subproblem(MDs, rho, last_p, last_lambhat, last_Dhat, lamb, Dmax, alpha, beta):
+def solve_MD_subproblem(ESP, MDs, rho, last_p, last_lambhat, last_Dhat, lamb, Dmax, alpha, beta):
     N = len(MDs)
     Dmax_arr = np.ones(N) * Dmax
     # ---- 把旧值拼成初始猜测 x0 ----
@@ -100,11 +100,13 @@ def solve_MD_subproblem(MDs, rho, last_p, last_lambhat, last_Dhat, lamb, Dmax, a
     for md in MDs:
         bounds.append((0, md.Fn))
     # 再加所有 λ̂_i 的 bounds
-    for _ in MDs:
-        bounds.append((0, None))
+    for md in MDs:
+        # 一个安全的上限是 F_max / (s*l)
+        lamb_hat_upper_bound = md.Fn / (md.s * md.l)
+        bounds.append((0, lamb_hat_upper_bound))
     # 再加所有 D̂_i 的 bounds
     for _ in MDs:
-        bounds.append((0, None))
+        bounds.append((0, ESP.D0-1e-6))
 
     for i, md in enumerate(MDs):
         idx_p, idx_lam, idx_D = i, N+i, 2*N+i
@@ -113,10 +115,19 @@ def solve_MD_subproblem(MDs, rho, last_p, last_lambhat, last_Dhat, lamb, Dmax, a
             return x[ip]/(m.s*m.l) - x[il] - 1e-8
         ineq_cons.append({'type':'ineq', 'fun': lam_upper})
 
-        def Dn_Dh(x, ip=idx_p, il=idx_lam, idd=idx_D, m=md):
-            denom = x[ip]/(m.s*m.l) - x[il] + 1e-8
-            return x[idd] - m.s/m.Rn - 1/denom
-        ineq_cons.append({'type':'ineq', 'fun': Dn_Dh})
+        # def Dn_Dh(x, ip=idx_p, il=idx_lam, idd=idx_D, m=md):
+        #     denom = x[ip]/(m.s*m.l) - x[il] + 1e-8
+        #     return x[idd] - m.s/m.Rn - 1/denom
+        # ineq_cons.append({'type':'ineq', 'fun': Dn_Dh})
+
+        # 使用下面这个新的、数值稳定的约束
+        def Dn_Dh_stable(x, ip=idx_p, il=idx_lam, idd=idx_D, m=md):
+            # (D_hat - T_transmission) * (p/(sl) - lambda_hat) - 1 >= 0
+            t_transmission = m.s / m.Rn
+            processing_margin = x[ip] / (m.s * m.l) - x[il]
+            return (x[idd] - t_transmission) * processing_margin - 1.0
+
+        ineq_cons.append({'type': 'ineq', 'fun': Dn_Dh_stable})
 
     # SLSQP 求解
     sol = minimize(
@@ -156,7 +167,7 @@ def ADMM(ESP,MDs):
         # ESP's global subproblem
         lamb,Dmax = solve_ESP_subproblem(ESP,N,rho, lamb_old, Dmax_old, p_old,lamb_hat,Dmax_hat,alpha,beta)
         # MDs' local subproblem
-        p, lamb_hat,Dmax_hat = solve_MD_subproblem(MDs,rho, p_old, lamb_hat_old, Dmax_hat_old, lamb, Dmax, alpha, beta)
+        p, lamb_hat,Dmax_hat = solve_MD_subproblem(ESP,MDs,rho, p_old, lamb_hat_old, Dmax_hat_old, lamb, Dmax, alpha, beta)
         # dual variable update
         alpha += rho*(lamb-lamb_hat)
         beta += rho*([Dmax for i in range(N)]-Dmax_hat)
