@@ -34,7 +34,7 @@ class MD:
     
     def delay(self,pn,lambdan):
         if lambdan < 1e-3: return 0
-        if pn/(self.s*self.l)<lambdan-1e-3: return None
+        if pn/(self.s*self.l)<lambdan-1e-6: return None
         return self.s/self.Rn + 1/(pn/(self.s*self.l)-lambdan)
     
     def energy(self,pn):
