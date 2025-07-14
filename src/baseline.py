@@ -103,14 +103,14 @@ def non_cooperative_baseline(ESP,MDs,verbose=False):
 
     # ---------- 5.  outer continuation parameters ----------
     outer_max_iter = 4
-    mu0  = 1e-2
-    rho0 = 1e2
+    mu0  = 1e-4
+    rho0 = 1e1
 
     # ---------- 6.  bounds & equality constraint ----------
     bounds = [(0, None)]                   # pi>=0
     bounds += [(0, lambda0)]*N                # λ
     bounds += [(Dmin, ESP.D0-1e-3)]        # Dmax
-    bounds += [(0, F[i]-1e-3) for i in range(N)] # p
+    bounds += [(0, F[i]-0.5) for i in range(N)] # p
     bounds += [(0, None)]*N                # alpha
     bounds += [(0, None)]*N                # beta
     # bounds += [(None, None)]*N             # s_gap  (free)
