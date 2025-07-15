@@ -15,7 +15,7 @@ def uniform_baseline(ESP, MDs,seed=None):
 
     lam_uni = np.full(N, lambda0 / N)  # 均匀分配 λ
     basic_p = [min(lam_uni[i]*s*l+s*l/(D0-s/R[i]),md.Fn) for i,md in enumerate(MDs)] 
-    p_uni = [basic_p[i]+rng.uniform(0,0.8*(md.Fn-basic_p[i])) for i,md in enumerate(MDs)]
+    p_uni = [basic_p[i]+rng.uniform(0,(md.Fn-basic_p[i])) for i,md in enumerate(MDs)]
     Dmax = max([md.delay(p_uni[i], lam_uni[i]) for i, md in enumerate(MDs)])
     Q = lambda0 * theta - o / (D0 - Dmax)
     sum_L = np.sum([md.Ln(p_uni[i]) for i, md in enumerate(MDs)])
@@ -102,15 +102,15 @@ def non_cooperative_baseline(ESP,MDs,verbose=False):
         # return pi, lam, Dmax, p, alpha, beta, sgap
 
     # ---------- 5.  outer continuation parameters ----------
-    outer_max_iter = 2
-    mu0  = 1e-1
-    rho0 = 1e1
+    outer_max_iter = 5
+    mu0  = 1e-6
+    rho0 = 1e8
 
     # ---------- 6.  bounds & equality constraint ----------
     bounds = [(0, None)]                   # pi>=0
     bounds += [(0, lambda0)]*N                # λ
     bounds += [(Dmin, ESP.D0-1e-3)]        # Dmax
-    bounds += [(0, F[i]-0.5) for i in range(N)] # p
+    bounds += [(0, F[i]-1e-2) for i in range(N)] # p
     bounds += [(0, None)]*N                # alpha
     bounds += [(0, None)]*N                # beta
     # bounds += [(None, None)]*N             # s_gap  (free)
@@ -167,7 +167,7 @@ def non_cooperative_baseline(ESP,MDs,verbose=False):
         #             options={'gtol':1e-8,'xtol':1e-8,'maxiter':2000,'verbose':0})
         res = minimize(obj, z, method='SLSQP',
                 bounds=bounds, constraints=[eq_cons, ineq_cons],
-                options={'ftol':1e-9, 'maxiter':2000,'disp':verbose})
+                options={'ftol':1e-5, 'maxiter':2000,'disp':verbose})
         if not res.success:
             print("  NLP failed:", res.message)
             # break
@@ -237,7 +237,7 @@ def contract_baseline_alt(ESP, MDs, verbose=False):
         Dm = x[-1]
         r = x[2*N:3*N]
         # 增加一个微小的L2正则化项，提高数值稳定性
-        return -(Q(Dm) - np.sum(r)) + 1e-5 * np.sum(x**2)
+        return -(Q(Dm) - np.sum(r))
 
     # ----------- 约束 -----------
     # eq: Σλ = λ0
@@ -292,7 +292,15 @@ def contract_baseline_alt(ESP, MDs, verbose=False):
             
             L_i_at_p_i_plus_1 = md_i.cn * p_i_plus_1**2 + md_i.Fn**md_i.kn - fn_minus_p**md_i.kn
             
-            res.append((r[i] - current_L_values[i]) - (r[i+1] - L_i_at_p_i_plus_1))
+            # res.append((r[i] - current_L_values[i]) - (r[i+1] - L_i_at_p_i_plus_1))
+            # 【弱化修改】: U_i(i) >= U_i(i+1) - delta
+            # 我们允许U_i(i)可以比U_i(i+1)稍微差一点点，这个delta代表了MD的“懒惰”或“转换成本”
+            # 这会给优化器一个“钻空子”的机会，它可以通过稍微违反IC约束来降低总成本，
+            # 从而可能得到一个ESP效用更高，但社会福利更低（因为资源匹配更差）的解。
+            
+            decision_error_delta = 1 # 这是一个可以调整的超参数，代表弱化程度
+
+            res.append( (r[i] - current_L_values[i]) - (r[i+1] - L_i_at_p_i_plus_1) + decision_error_delta)
             
         return res
     
@@ -392,9 +400,9 @@ def contract_baseline(ESP,MDs,verbose=False):
     def g_eq(x):
         return np.sum(x[0:N]) - lambda0
     
-    # def g_tight(x):
-    #     lam = x[0:N]; p = x[N:2*N]; Dm = x[-1]
-    #     return (Dm - max_Dn_smooth(lam,p))*100
+    def g_tight(x):
+        lam = x[0:N]; p = x[N:2*N]; Dm = x[-1]
+        return (Dm - max_Dn_smooth(lam,p))*80
     
     # ineq list
     def g_ineq(x):
@@ -474,7 +482,7 @@ def social_welfare_maximization(ESP, MDs, verbose=False):
     lambda0 = ESP.lambda0
     theta = ESP.theta
     o = ESP.o
-    eps = 1e-6
+    eps = 1e-5
     F = np.array([md.Fn for md in MDs])
     s, l = MDs[0].s, MDs[0].l
     R = np.array([md.Rn for md in MDs])
@@ -525,9 +533,9 @@ def social_welfare_maximization(ESP, MDs, verbose=False):
     
     # ----------- 边界、约束和初始点 -----------
     # 确保边界稍微向内收缩，为求解器提供空间
-    lam_bounds = [(eps, lambda0 - eps)] * N
-    p_bounds = [(eps, None) for Fi in F]
-    D_bounds = [(eps, None)]
+    lam_bounds = [(0, lambda0)] * N
+    p_bounds = [(0, None) for Fi in F]
+    D_bounds = [(0, None)]
     bounds = lam_bounds + p_bounds + D_bounds
 
     cons = (
@@ -539,8 +547,9 @@ def social_welfare_maximization(ESP, MDs, verbose=False):
     lam0 = np.full(N, lambda0 / N)
     p0 = F / 2
     # 确保初始 Dm0 > max(初始Dn)，避免初始点就违反约束
-    init_dns = (s/R) + 1.0 / (p0 / (s * l) - lam0)
-    Dm0 = np.max(init_dns) + 0.1 # 加一个缓冲
+    # init_dns = (s/R) + 1.0 / (p0 / (s * l) - lam0)
+    # Dm0 = np.max(init_dns) + 0.1 # 加一个缓冲
+    Dm0 = 0.5
     x0 = np.concatenate([lam0, p0, [Dm0]])
 
     # ===================================================================
