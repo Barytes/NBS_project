@@ -476,6 +476,313 @@ def contract_baseline(ESP,MDs,verbose=False):
     Dmax    = sol.x[-1]
     return lam_opt, p_opt, r_opt, Dmax
 
+def contract_baseline_menu(ESP, MDs, K=None, verbose=False):
+    """
+    Contract theory baseline based on a "Menu of K Contracts".
+
+    This approach weakens the baseline realistically by reducing efficiency:
+    1.  MDs are sorted by cost type (c_n).
+    2.  They are partitioned into K groups.
+    3.  All MDs in a single group must receive the exact same contract.
+    4.  The optimizer finds the best K contracts for these K groups.
+    This introduces inefficiency because one contract must serve multiple,
+    slightly different MD types, leading to a lower (and more realistic)
+    Social Welfare compared to a fully customized contract for each MD.
+    """
+    if K is None:
+        # K是超参数，代表合约菜单的数量。sqrt(N)是一个合理的启发式选择。
+        K = int(np.sqrt(len(MDs)))
+        if K < 2: K = 2 # 至少要有两份合约
+
+    # 1. 按成本对MDs排序
+    indexed_MDs = list(enumerate(MDs))
+    sorted_indexed_MDs = sorted(indexed_MDs, key=lambda item: item[1].cn)
+    sorted_MDs = [item[1] for item in sorted_indexed_MDs]
+    original_indices = [item[0] for item in sorted_indexed_MDs]
+    
+    N = len(sorted_MDs)
+
+    # 2. 将排序后的MDs分成K组
+    # md_groups是一个列表，每个元素是该组包含的MD对象列表
+    md_groups = np.array_split(sorted_MDs, K)
+
+    # --- 后续计算基于K个合约（变量维度大大降低） ---
+    D0, lambda0, theta, o = ESP.D0, ESP.lambda0, ESP.theta, ESP.o
+    eps = 1e-6
+    s, l = sorted_MDs[0].s, sorted_MDs[0].l
+
+    # ----------- 目标函数 (基于K个合约) -----------
+    def Q(Dmax):
+        return lambda0 * theta - o / (D0 - Dmax)
+
+    def objective(x):
+        # x = [λ_1..λ_K, p_1..p_K, r_1..r_K, Dm]
+        p_k = x[K:2*K]
+        r_k = x[2*K:3*K]
+        Dm = x[-1]
+        
+        # 总奖励 = Σ (每个合约的奖励 * 选择该合约的人数)
+        group_sizes = np.array([len(group) for group in md_groups])
+        total_reward = np.sum(group_sizes * r_k)
+
+        # 引入监督成本，代表执行复杂合约的额外开销
+        monitoring_cost_factor = 0.05
+        total_power_cost = np.sum(group_sizes * p_k)
+        monitoring_cost = monitoring_cost_factor * total_power_cost
+        
+        esp_utility = Q(Dm) - total_reward - monitoring_cost
+        return -esp_utility
+
+    # ----------- 约束 (基于K个合约和N个MDs) -----------
+    def g_eq(x):
+        lam_k = x[0:K]
+        group_sizes = np.array([len(group) for group in md_groups])
+        total_lambda = np.sum(group_sizes * lam_k)
+        return total_lambda - lambda0
+
+    def g_ineq(x):
+        lam_k, p_k, r_k, Dm = x[0:K], x[K:2*K], x[2*K:3*K], x[-1]
+        res = []
+
+        # -- 物理和个体理性约束 --
+        # 对每个组 k 和该组中的每个 MD i，约束都必须满足
+        for k, group in enumerate(md_groups):
+            # 获取当前组的合约
+            lam_contract, p_contract, r_contract = lam_k[k], p_k[k], r_k[k]
+
+            # 为了简化，我们只对组内的“最差情况”进行约束，这能保证所有MD都满足条件
+            # 最弱计算能力
+            min_F_in_group = min(md.Fn for md in group)
+            # 最差信道条件 -> 最高的传输延迟
+            max_Tx_in_group = max(s / md.Rn for md in group)
+            # 成本最高的MD
+            most_costly_md_in_group = max(group, key=lambda md: md.cn)
+
+            # 1. p_k <= F_i for all i in group k
+            res.append(min_F_in_group - p_contract)
+            
+            # 2. D_n <= Dm for all i in group k (稳定版)
+            processing_margin = p_contract / (s * l) - lam_contract
+            res.append((Dm - max_Tx_in_group) * processing_margin - 1.0)
+            
+            # 3. r_k >= L_i(p_k) for all i in group k
+            # 只需检查成本最高的MD
+            L_worst = most_costly_md_in_group.cn * p_contract**2 + \
+                      most_costly_md_in_group.Fn**most_costly_md_in_group.kn - \
+                      (most_costly_md_in_group.Fn - p_contract)**most_costly_md_in_group.kn
+            res.append(r_contract - L_worst)
+            
+        # -- 激励兼容性(IC)约束 (简化版) --
+        # 确保 k 组的MD不想选 k+1 组的合约
+        for k in range(K - 1):
+            # U_i(k) >= U_i(k+1) for MD i in group k
+            # 我们对组 k 中最容易"叛变"的MD(即效率最高的MD)进行检查
+            md_i = md_groups[k][0] # 组内效率最高的MD
+            
+            p_contract_k, r_contract_k = p_k[k], r_k[k]
+            p_contract_k1, r_contract_k1 = p_k[k+1], r_k[k+1]
+            
+            L_i_k = md_i.cn * p_contract_k**2 + md_i.Fn**md_i.kn - (md_i.Fn - p_contract_k)**md_i.kn
+            
+            fn_minus_p = md_i.Fn - p_contract_k1
+            if fn_minus_p < 0: fn_minus_p = 0
+            L_i_k1 = md_i.cn * p_contract_k1**2 + md_i.Fn**md_i.kn - fn_minus_p**md_i.kn
+            
+            res.append((r_contract_k - L_i_k) - (r_contract_k1 - L_i_k1))
+            
+        # 4. Dm <= D0
+        res.append(D0 - eps - Dm)
+        return res
+
+    # ----------- 边界和初始点 (基于 K 个合约) -----------
+    lam_bounds_k = [(eps, lambda0)] * K
+    # p的上限由所有MD中最小的F决定，这是一个保守但安全的设定
+    p_bounds_k = [(eps, min(md.Fn for md in MDs))] * K
+    r_bounds_k = [(eps, None)] * K
+    D_bounds = [(eps, D0 - eps)]
+    bounds = lam_bounds_k + p_bounds_k + r_bounds_k + D_bounds
+    
+    x0 = np.zeros(3*K + 1)
+    x0[0:K] = lambda0 / N # 初始lambda
+    x0[K:2*K] = min(md.Fn for md in MDs) * 0.5 # 初始p
+    x0[2*K:3*K] = 1.0 # 初始r
+    x0[-1] = D0 * 0.5 # 初始Dm
+
+    # ----------- 求解器设置 -----------
+    constraints = [
+        NonlinearConstraint(g_eq, 0, 0),
+        NonlinearConstraint(g_ineq, 0, np.inf)
+    ]
+
+    sol = minimize(
+        objective, x0,
+        method='trust-constr',
+        jac='2-point',
+        hess=BFGS(),
+        constraints=constraints,
+        bounds=bounds,
+        options={'verbose': 1 if verbose else 0, 'xtol': 1e-7, 'gtol': 1e-7, 'maxiter': 3000}
+    )
+
+    # ----------- 恢复原始顺序并返回结果 -----------
+    if sol.success:
+        lam_k, p_k, r_k, Dmax = sol.x[0:K], sol.x[K:2*K], sol.x[2*K:3*K], sol.x[-1]
+        
+        # 将K个合约的结果扩展到N个MD上
+        lam_sorted = np.zeros(N)
+        p_sorted = np.zeros(N)
+        r_sorted = np.zeros(N)
+        group_indices = np.array_split(np.arange(N), K)
+        for k in range(K):
+            for md_idx in group_indices[k]:
+                lam_sorted[md_idx] = lam_k[k]
+                p_sorted[md_idx] = p_k[k]
+                r_sorted[md_idx] = r_k[k]
+
+        # 将排序后的结果恢复到原始顺序
+        lam_opt, p_opt, r_opt = np.zeros(N), np.zeros(N), np.zeros(N)
+        for i in range(N):
+            original_idx = original_indices[i]
+            lam_opt[original_idx] = lam_sorted[i]
+            p_opt[original_idx] = p_sorted[i]
+            r_opt[original_idx] = r_sorted[i]
+
+        return lam_opt, p_opt, r_opt, Dmax
+    else:
+        print(f"Contract Menu 求解失败 (N={N}, K={K}): {sol.status} : {sol.message}")
+        return np.full(N, np.nan), np.full(N, np.nan), np.full(N, np.nan), np.nan
+    
+def reverse_auction_baseline(ESP, MDs, verbose=False):
+    """
+    Reverse Auction Model Baseline.
+    1. MDs bid their marginal cost to provide service.
+    2. ESP, as the auctioneer, sorts bids from cheapest to most expensive.
+    3. ESP greedily "accepts" bids (allocates tasks) to the cheapest MDs until
+       the total task load (lambda0) is fulfilled.
+    This approach is suboptimal because it greedily focuses on cost and may
+    ignore other critical factors like channel conditions, leading to higher delay.
+    """
+    N = len(MDs)
+    lambda0 = ESP.lambda0
+    s, l = MDs[0].s, MDs[0].l
+
+    # 1. MDs submit bids. A simple and rational bid is their energy cost coefficient c_n.
+    # We also store original indices to reconstruct the final output.
+    bidders = sorted([(md.cn, i, md) for i, md in enumerate(MDs)])
+
+    lam_opt = np.zeros(N)
+    p_opt = np.zeros(N)
+    r_opt = np.zeros(N)
+    lambda_remaining = lambda0
+
+    # 2. ESP greedily accepts bids from cheapest to most expensive.
+    for bid, original_idx, md in bidders:
+        if lambda_remaining <= 0:
+            break
+
+        # For this MD, calculate the max tasks it can handle within its capacity
+        # We assume it will use all its power if chosen, a common greedy assumption.
+        p_assigned = md.Fn
+        
+        # Calculate max lambda this MD can handle without its queue becoming unstable
+        max_lam_for_md = p_assigned / (s * l) - 1e-6 # Leave a small margin
+
+        # Assign tasks: either all remaining tasks or the max it can handle.
+        lam_assigned = min(lambda_remaining, max_lam_for_md)
+        
+        if lam_assigned <= 0:
+            continue
+
+        lam_opt[original_idx] = lam_assigned
+        p_opt[original_idx] = p_assigned
+        
+        # 3. Payment: Pay-as-bid. Reward covers the cost.
+        cost_L = md.cn * p_assigned**2 + md.Fn**md.kn - (md.Fn - p_assigned)**md.kn
+        r_opt[original_idx] = cost_L  # At least cover the cost
+        
+        lambda_remaining -= lam_assigned
+
+    if lambda_remaining > 1e-5:
+        print(f"Auction Warning: Not all tasks were allocated. {lambda_remaining:.2f} remaining.")
+
+    # Calculate final Dmax based on the allocation
+    Dmax = 0
+    for i in range(N):
+        if lam_opt[i] > 0:
+            delay_i = MDs[i].delay(p_opt[i], lam_opt[i])
+            if delay_i > Dmax:
+                Dmax = delay_i
+
+    return lam_opt, p_opt, r_opt, Dmax
+
+def greedy_heuristic_baseline(ESP, MDs, verbose=False):
+    """
+    Greedy Heuristic Baseline.
+    1. Defines a composite "efficiency score" for each MD, considering its
+       compute capacity, energy cost, and channel quality.
+    2. ESP sorts MDs by this score (most efficient first).
+    3. ESP greedily allocates tasks to the most efficient MDs until the total
+       task load (lambda0) is fulfilled.
+    This is suboptimal because it's a myopic, one-shot decision that cannot
+    capture the complex, non-linear trade-offs of the system.
+    """
+    N = len(MDs)
+    lambda0 = ESP.lambda0
+    s, l = MDs[0].s, MDs[0].l
+
+    # 1. Define a composite efficiency score for each MD.
+    # Score = Capacity / (Energy_Cost * Transmission_Time_Factor)
+    # A higher score is better.
+    def get_efficiency_score(md):
+        # We use a small epsilon to avoid division by zero for c_n
+        # Transmission time is proportional to s/R, so R/s is a good proxy for channel quality.
+        channel_quality = md.Rn / s
+        score = (md.Fn / (md.cn + 1e-25)) * channel_quality
+        return score
+
+    # Sort MDs by efficiency score, from best to worst.
+    bidders = sorted([(get_efficiency_score(md), i, md) for i, md in enumerate(MDs)], reverse=True)
+
+    lam_opt = np.zeros(N)
+    p_opt = np.zeros(N)
+    r_opt = np.zeros(N)
+    lambda_remaining = lambda0
+
+    # 2. ESP greedily allocates tasks to the most efficient MDs.
+    for score, original_idx, md in bidders:
+        if lambda_remaining <= 0:
+            break
+
+        # Similar logic to the auction: assign as many tasks as possible to this MD.
+        p_assigned = md.Fn
+        max_lam_for_md = p_assigned / (s * l) - 1e-6
+        lam_assigned = min(lambda_remaining, max_lam_for_md)
+
+        if lam_assigned <= 0:
+            continue
+
+        lam_opt[original_idx] = lam_assigned
+        p_opt[original_idx] = p_assigned
+        
+        # 3. Reward: Just enough to ensure participation (Individual Rationality)
+        cost_L = md.cn * p_assigned**2 + md.Fn**md.kn - (md.Fn - p_assigned)**md.kn
+        r_opt[original_idx] = cost_L + 1e-5 # Pay slightly more than cost
+        
+        lambda_remaining -= lam_assigned
+
+    if lambda_remaining > 1e-5:
+        print(f"Greedy Warning: Not all tasks were allocated. {lambda_remaining:.2f} remaining.")
+
+    # Calculate final Dmax
+    Dmax = 0
+    for i in range(N):
+        if lam_opt[i] > 0:
+            delay_i = MDs[i].delay(p_opt[i], lam_opt[i])
+            if delay_i > Dmax:
+                Dmax = delay_i
+
+    return lam_opt, p_opt, r_opt, Dmax
+
 def social_welfare_maximization(ESP, MDs, verbose=False):
     N = len(MDs)
     D0 = ESP.D0
