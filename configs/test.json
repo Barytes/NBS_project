@@ -1,5 +1,5 @@
 {
-  "num_mds": 25,
+  "num_mds": 20,
   "lambda0" : 50,
   "s": 0.1,
   "l": 0.8,
@@ -7,8 +7,8 @@
   "cn_range": [0.8, 1.2],
   "kn_range": [0.1, 0.9],
   "Fn_range": [1, 5],
-  "theta": 1.5,
-  "o": 10,
+  "theta": 2,
+  "o": 5,
   "omega_0": 2,
   "omega_n": 1
 }
