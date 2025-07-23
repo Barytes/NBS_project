@@ -28,11 +28,89 @@ def proportional_baseline(ESP,MDs,seed=None):
     lamb = proportion * ESP.lambda0
     rng = np.random.default_rng(seed)
     basic_p = [min(lamb[i]*md.s*md.l+md.s*md.l/(ESP.D0-md.s/md.Rn),md.Fn) for i,md in enumerate(MDs)] 
-    p = [basic_p[i]+rng.uniform(0,(md.Fn-basic_p[i])) for i,md in enumerate(MDs)]
+    p = [basic_p[i]+rng.uniform(0.3*(md.Fn-basic_p[i]),(md.Fn-basic_p[i])) for i,md in enumerate(MDs)]
     Dmax = max([md.delay(p[i], lamb[i]) for i, md in enumerate(MDs)])
     Q = ESP.lambda0 * ESP.theta - ESP.o / (ESP.D0 - Dmax)
     sum_L = np.sum([md.Ln(p[i]) for i, md in enumerate(MDs)])
     r = np.maximum(Q - sum_L, 0) * proportion  # 均匀分配 r
+    return lamb, p, r, Dmax
+
+def uniform_baseline_smarter(ESP, MDs, seed=None):
+    N = len(MDs)
+    D0, lambda0, s, l = ESP.D0, ESP.lambda0, MDs[0].s, MDs[0].l
+    R = np.array([md.Rn for md in MDs])
+    rng = np.random.default_rng(seed)
+
+    # 1. Lambda allocation remains naive (uniform)
+    lam_uni = np.full(N, lambda0 / N)
+
+    # 2. Each MD gets its own random delay target coefficient
+    delay_coeffs = rng.uniform(low=0.6*D0, high=0.9*D0, size=N)
+    
+    # 3. Each MD calculates the precise power 'p' to meet its personal target
+    p_uni = np.zeros(N)
+    actual_delays = np.zeros(N)
+
+    for i, md in enumerate(MDs):
+        target_delay_i = D0 * delay_coeffs[i]
+        
+        # Check if the target is physically achievable
+        if target_delay_i <= s / R[i] + 1e-6:
+            p_uni[i] = md.Fn # Impossible target, use max power
+        else:
+            # Calculate the minimum power required for this MD's personal target
+            p_required = lam_uni[i] * s * l + (s * l) / (target_delay_i - s / R[i])
+            # Power cannot exceed physical capacity
+            p_uni[i] = min(p_required, md.Fn)
+
+        # Store the actual delay achieved with the calculated power
+        delay_val = md.delay(p_uni[i], lam_uni[i])
+        actual_delays[i] = delay_val if delay_val is not None else D0
+
+    # 4. Subsequent calculations remain the same
+    Dmax = np.max(actual_delays)
+    Q = ESP.Q(Dmax) if Dmax < D0 else -np.inf
+    sum_L = np.sum([md.Ln(p_uni[i]) for i, md in enumerate(MDs)])
+    r_uni = np.full(N, max(Q - sum_L, 0) / N)
+
+    return lam_uni, p_uni, r_uni, Dmax
+
+def proportional_baseline_smarter(ESP, MDs, seed=None):
+    N = len(MDs)
+    D0, lambda0, s, l = ESP.D0, ESP.lambda0, MDs[0].s, MDs[0].l
+    R = np.array([md.Rn for md in MDs])
+    rng = np.random.default_rng(seed)
+
+    # 1. Lambda allocation remains naive (proportional to capacity)
+    sum_F = np.sum([md.Fn for md in MDs])
+    proportion = np.array([md.Fn/sum_F for md in MDs])
+    lamb = proportion * lambda0
+
+    # 2. Each MD gets its own random delay target coefficient
+    delay_coeffs = rng.uniform(low=0.6*D0, high=0.9*D0, size=N)
+    
+    # 3. Each MD calculates the precise power 'p' to meet its personal target
+    p = np.zeros(N)
+    actual_delays = np.zeros(N)
+
+    for i, md in enumerate(MDs):
+        target_delay_i = D0 * delay_coeffs[i]
+        
+        if target_delay_i <= s / R[i] + 1e-6:
+            p[i] = md.Fn
+        else:
+            p_required = lamb[i] * s * l + (s * l) / (target_delay_i - s / R[i])
+            p[i] = min(p_required, md.Fn)
+            
+        delay_val = md.delay(p[i], lamb[i])
+        actual_delays[i] = delay_val if delay_val is not None else D0
+
+    # 4. Subsequent calculations remain the same
+    Dmax = np.max(actual_delays)
+    Q = ESP.Q(Dmax) if Dmax < D0 else -np.inf
+    sum_L = np.sum([md.Ln(p[i]) for i, md in enumerate(MDs)])
+    r = max(Q - sum_L, 0) * proportion
+
     return lamb, p, r, Dmax
 
 def non_cooperative_baseline(ESP,MDs,verbose=False):
@@ -413,159 +491,194 @@ def contract_baseline_stable(ESP, MDs, verbose=False):
         return np.full(N, np.nan), np.full(N, np.nan), np.full(N, np.nan), np.nan
     
 
-def _design_contract_menu(ESP, K_types):
+def _design_contract_menu(ESP, K_types, N_k_counts, verbose=False):
     """
-    Offline phase: Designs the optimal menu of K contracts for K representative MD types.
-    This is the core optimizer for the type-based contract theory model.
+    Corrected offline phase: Designs the optimal menu of K contracts for K
+    representative MD types under ASYMMETRIC information.
     """
     K = len(K_types)
     lambda0, D0, theta, o, s, l = ESP.lambda0, ESP.D0, ESP.theta, ESP.o, ESP.s, ESP.l
-
-    # The variables are K contracts: x = [p_1..p_K, r_1..r_K]
-    # We assume lambda is distributed proportionally to p, so we don't optimize it directly here.
+    eps = 1e-6
 
     def Q(Dmax):
+        if Dmax >= D0: return -np.inf
         return lambda0 * theta - o / (D0 - Dmax)
+
+    # --- Optimization Variables ---
+    # x = [λ_1..λ_K, p_1..p_K, r_1..r_K, Dmax], total size: 3K + 1
     
-    def objective(x): # Maximize ESP's expected utility
-        p_k, r_k = x[0:K], x[K:2*K]
-        
-        # Assume types are uniformly distributed
-        type_probabilities = np.full(K, 1.0/K)
-        
-        # We need to find Dmax. For a given allocation, Dmax will be max(Dn).
-        # We assume lambda is allocated proportionally to power `p_k` to simplify.
-        total_power = np.sum(p_k * type_probabilities * (N_for_design/K)) # N_for_design is a scaling factor
-        lam_k = (lambda0 / total_power) * p_k if total_power > 0 else np.zeros(K)
+    # --- Objective Function ---
+    def objective(x):
+        r_k = x[2*K:3*K]
+        Dm = x[3*K]
+        total_revenue = Q(Dm)
+        total_payout = np.sum(np.array(N_k_counts) * r_k)
+        profit = total_revenue - total_payout
+        return -profit
 
-        d_n_k = np.zeros(K)
-        for k, type_md in enumerate(K_types):
-            d_n_k[k] = s / type_md.Rn + 1.0 / (p_k[k] / (s*l) - lam_k[k] + 1e-9)
-
-        Dm = np.max(d_n_k)
-        
-        expected_utility = np.sum(type_probabilities * (Q(Dm)/K - r_k))
-        return -expected_utility
+    # --- Constraints ---
+    def g_eq(x):
+        lam_k = x[0:K]
+        return np.sum(np.array(N_k_counts) * lam_k) - lambda0
 
     def g_ineq(x):
-        p_k, r_k = x[0:K], x[K:2*K]
+        lam_k, p_k, r_k, Dm = x[0:K], x[K:2*K], x[2*K:3*K], x[3*K]
         res = []
 
-        # IR: Each type k must get non-negative utility from its own contract k
+        # Loop through each of the K types to apply constraints
         for k, type_md in enumerate(K_types):
-            L_k_k = type_md.cn * p_k[k]**2 + type_md.Fn**type_md.kn - (type_md.Fn - p_k[k])**type_md.kn
-            res.append(r_k[k] - L_k_k)
+            # Individual Rationality (IR): r_k >= L_k(p_k)
+            res.append(r_k[k] - type_md.Ln(p_k[k]))
 
-        # IC: Each type k must prefer contract k over any other contract j
+            # Queue Stability: p_k / (s*l) - λ_k >= ε
+            res.append(p_k[k] / (s * l) - lam_k[k] - eps)
+
+            # Delay Constraint (stable version): D_k <= Dmax
+            Tx_k = s / type_md.Rn
+            processing_margin = p_k[k] / (s * l) - lam_k[k]
+            # Add a small positive constant to margin to prevent it from being zero
+            res.append((Dm - Tx_k) * (processing_margin + eps) - 1.0)
+        
+        # Incentive Compatibility (IC): type k must prefer contract k over any contract j
         for k, type_md_k in enumerate(K_types):
-            L_k_k = type_md_k.cn * p_k[k]**2 + type_md_k.Fn**type_md_k.kn - (type_md_k.Fn - p_k[k])**type_md_k.kn
-            utility_k_k = r_k[k] - L_k_k
+            utility_k_k = r_k[k] - type_md_k.Ln(p_k[k])
             for j in range(K):
                 if k == j: continue
-                fn_minus_p = type_md_k.Fn - p_k[j]
-                if fn_minus_p < 0: fn_minus_p = 0
-                L_k_j = type_md_k.cn * p_k[j]**2 + type_md_k.Fn**type_md_k.kn - fn_minus_p**type_md_k.kn
-                utility_k_j = r_k[j] - L_k_j
+                utility_k_j = r_k[j] - type_md_k.Ln(p_k[j])
                 res.append(utility_k_k - utility_k_j)
 
-        # Physical constraints for each contract
-        total_power = np.sum(p_k * (1/K) * (N_for_design/K))
-        lam_k = (lambda0 / total_power) * p_k if total_power > 0 else np.zeros(K)
-        res.extend(p_k / (s * l) - lam_k - 1e-6)
-
+        # System-wide delay limit
+        res.append(D0 - eps - Dm)
         return res
-
-    # Define K representative MD types (e.g., low, medium, high cost)
-    # This is a simplification. A more complex model would use a continuous distribution.
-    N_for_design = 20 # A typical number of MDs for which we design the contract
     
+    # --- Bounds and Initial Guess ---
     bounds = []
-    for md_type in K_types:
-        bounds.append((1e-6, md_type.Fn - 1e-6)) # p_k bounds
-    bounds += [(0, None)] * K # r_k bounds
+    # Bounds for λ_k
+    bounds += [(eps, lambda0)] * K
+    # Bounds for p_k - CORRECTED
+    bounds += [(eps, type_md.Fn - eps) for type_md in K_types]
+    # Bounds for r_k
+    bounds += [(0, None)] * K
+    # Bounds for Dmax - RE-ADDED
+    bounds.append((eps, D0 - eps))
 
-    x0 = np.zeros(2*K)
-    x0[0:K] = np.mean([md.Fn for md in K_types]) * 0.5 # p_k initial
-    x0[K:2*K] = 1.0 # r_k initial
-    
-    constraints = [NonlinearConstraint(g_ineq, 0, np.inf)]
-    
+    # A simple but safe initial guess - CORRECTED SIZE
+    x0 = np.zeros(3*K + 1)
+    x0[0:K] = lambda0 / np.sum(N_k_counts)
+    x0[K:2*K] = np.array([md.Fn * 0.5 for md in K_types])
+    x0[2*K:3*K] = np.array([md.Ln(p_val) + 1 for md, p_val in zip(K_types, x0[K:2*K])])
+    # Initial Dmax must be feasible for the initial guess
+    init_dns = [(s/md.Rn) + 1.0 / (p/(s*l) - lam + eps) for md,p,lam in zip(K_types, x0[K:2*K], x0[0:K])]
+    x0[3*K] = np.max(init_dns) + 0.1
+
+    # --- Solver Call ---
+    constraints = [
+        NonlinearConstraint(g_eq, 0, 0),
+        NonlinearConstraint(g_ineq, 0, np.inf)
+    ]
+
     sol = minimize(objective, x0, method='trust-constr', jac='2-point', hess=BFGS(),
                    constraints=constraints, bounds=bounds,
-                   options={'xtol': 1e-7, 'gtol': 1e-7, 'maxiter': 2000})
+                   options={'verbose': 1 if verbose else 0, 'xtol': 1e-8, 'gtol': 1e-8, 'maxiter': 3000})
 
     if not sol.success:
-        print("Warning: Contract menu design did not converge perfectly.")
+        print("Contract menu design failed to converge.")
+        return None, None
 
-    p_k_opt, r_k_opt = sol.x[0:K], sol.x[K:2*K]
-    total_power = np.sum(p_k_opt * (1/K) * (N_for_design/K))
-    lam_k_opt = (lambda0 / total_power) * p_k_opt if total_power > 0 else np.zeros(K)
+    # --- Return the designed menu ---
+    lam_opt, p_opt, r_opt = sol.x[0:K], sol.x[K:2*K], sol.x[2*K:3*K]
+    menu = [{'lambda': lam, 'p': p, 'r': r} for lam, p, r in zip(lam_opt, p_opt, r_opt)]
+    dmax_opt = sol.x[3*K]
+    if verbose:
+        print("Designed contract menu:")
+        for i, contract in enumerate(menu):
+            print(f"Contract {i}: λ={contract['lambda']}, p={contract['p']}, r={contract['r']}")
+        print(f"Optimal Dmax: {dmax_opt}")
     
-    # Return the menu of K contracts
-    return [{'lambda': lam, 'p': p, 'r': r} for lam, p, r in zip(lam_k_opt, p_k_opt, r_k_opt)]
+    return menu, dmax_opt
 
 def contract_type_based_baseline(ESP, MDs, K=3, verbose=False):
     """
     Online phase: Simulates the behavior of N MDs choosing from a pre-designed
-    menu of K optimal contracts.
+    menu of K optimal contracts, with robust final allocation.
     """
-    # 1. Define K representative "types" to design the menu for.
-    # We create these by taking quantiles of the cost distribution of the actual MDs.
+    N = len(MDs)
+    # 1. Select K representative types
+    if N < K: K = N
     sorted_by_cost = sorted(MDs, key=lambda md: md.cn)
-    indices = np.linspace(0, len(MDs) - 1, K, dtype=int)
+    indices = np.linspace(0, N - 1, K, dtype=int)
     K_types = [sorted_by_cost[i] for i in indices]
+    group_indices = np.array_split(np.arange(N), K)
+    N_k_counts = [len(group) for group in group_indices]
 
-    # 2. Call the offline designer to get the optimal K-item menu
-    try:
-        contract_menu = _design_contract_menu(ESP, K_types)
-    except Exception as e:
-        print(f"Contract design phase failed: {e}")
-        # Return a failure case
-        return np.full(len(MDs), np.nan), np.full(len(MDs), np.nan), np.full(len(MDs), np.nan), np.nan
+    # 2. Design the contract menu
+    # try:
+    # Assuming _design_contract_menu is your latest correct version
+    contract_menu, designed_dmax = _design_contract_menu(ESP, K_types, N_k_counts, verbose)
+    if contract_menu is None:
+        raise RuntimeError("Menu design returned None.")
+    # except Exception as e:
+    #     print(f"Contract design phase failed: {e}")
+    #     return np.full(N, np.nan), np.full(N, np.nan), np.full(N, np.nan), np.nan
 
-    # 3. Online Simulation: Each of the N MDs chooses the best contract for itself
-    lam_opt, p_opt, r_opt = np.zeros(len(MDs)), np.zeros(len(MDs)), np.zeros(len(MDs))
+    # 3. Online Simulation: Each MD selects its preferred contract
+    p_opt = np.zeros(N)
+    r_opt = np.zeros(N)
 
     for i, md in enumerate(MDs):
         best_utility = -np.inf
-        best_contract = None
-
+        best_contract_choice = None
         for contract in contract_menu:
             p_k, r_k = contract['p'], contract['r']
-            
-            # Check if this contract is physically possible for this MD
-            if p_k > md.Fn:
-                utility = -np.inf
-            else:
-                fn_minus_p = md.Fn - p_k
-                if fn_minus_p < 0: fn_minus_p = 0
-                cost_L = md.cn * p_k**2 + md.Fn**md.kn - fn_minus_p**md.kn
-                utility = r_k - cost_L
-            
+            if p_k > md.Fn: continue
+            utility = r_k - md.Ln(p_k)
             if utility > best_utility:
                 best_utility = utility
-                best_contract = contract
-
-        if best_contract is not None:
-            lam_opt[i] = best_contract['lambda']
-            p_opt[i] = best_contract['p']
-            r_opt[i] = best_contract['r']
+                best_contract_choice = contract
+        
+        if best_contract_choice is not None:
+            p_opt[i] = best_contract_choice['p']
+            r_opt[i] = best_contract_choice['r']
     
-    # 4. Check if the total allocated lambda respects the constraint
-    # This allocation is based on MD choices, so it might not sum to lambda0
-    # We need to scale it.
-    total_lambda_chosen = np.sum(lam_opt)
-    if total_lambda_chosen > 1e-6:
-        lam_opt = lam_opt * (ESP.lambda0 / total_lambda_chosen)
+    # 4. Final Allocation Phase
+    lam_opt = np.zeros(N)
+    
+    # Calculate the total power committed by all MDs who chose a contract
+    total_power_committed = np.sum(p_opt)
+    
+    if total_power_committed > 1e-6:
+        # The ESP now distributes the REAL total load (lambda0) proportionally
+        # to the POWER each MD has committed to providing.
+        for i in range(N):
+            if p_opt[i] > 0: # Only allocate to MDs who made a commitment
+                lam_opt[i] = ESP.lambda0 * (p_opt[i] / total_power_committed)
+    else:
+        print("Warning: No MDs committed any power.")
+        return np.zeros(N), np.zeros(N), np.zeros(N), ESP.D0
 
-    # 5. Calculate final performance metrics
+    # 5. Calculate final performance metrics with the new, stable allocation
     Dmax = 0
-    for i in range(len(MDs)):
-        if lam_opt[i] > 0:
-            delay_i = MDs[i].delay(p_opt[i], lam_opt[i])
-            if delay_i > Dmax:
-                Dmax = delay_i
-                
+    infeasible_count = 0
+    for i in range(N):
+        # We still need to check for infeasibility, as the total committed
+        # power might not be enough for the total lambda0 load.
+        delay_i = MDs[i].delay(p_opt[i], lam_opt[i])
+        
+        if delay_i is None:
+            infeasible_count += 1
+            # This MD is overloaded; its contribution is invalid.
+            # Set its lambda and p to 0 for final metrics.
+            lam_opt[i], p_opt[i] = 0, 0
+            continue # Skip to the next MD
+            
+        if lam_opt[i] > 0 and delay_i > Dmax:
+            Dmax = delay_i
+    
+    if infeasible_count > 0:
+        # If any MDs were overloaded, the system has failed to meet the demand.
+        print(f"Warning: {infeasible_count} MD(s) had infeasible allocations in Contract baseline.")
+        Dmax = ESP.D0 # Assign a penalty delay
+
     return lam_opt, p_opt, r_opt, Dmax
     
 def reverse_auction_baseline(ESP, MDs, verbose=False):

@@ -48,7 +48,15 @@ class MD:
         return rn+self.bn(pn)-self.energy(pn)
     
     def Ln(self,pn):
-        return self.energy(pn)+self.bn(0)-self.bn(pn)
+        bn_val = self.bn(pn)
+        
+        # Check if the result from bn() is invalid (None)
+        if bn_val is None:
+            # Return a large penalty value if pn is outside the valid domain [0, Fn]
+            return 1e20 
+        
+        # If the input was valid, proceed with the normal calculation
+        return self.energy(pn) + self.bn(0) - bn_val
 
 
 class ESP:
