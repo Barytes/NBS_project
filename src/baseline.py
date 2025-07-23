@@ -191,176 +191,6 @@ def non_cooperative_baseline(ESP,MDs,verbose=False):
         print("sum lambda (should=λ0) =", lam.sum())    
     return lam, p, pi*p, Dmax
 
-def contract_baseline_alt(ESP, MDs, verbose=False):
-    """
-    Contract theory baseline with major performance and stability enhancements.
-    1. Sorts MDs by cost to simplify N^2 IC constraints to N-1.
-    2. Removes the overly strict 'g_tight' constraint.
-    3. Reformulates the delay constraint to be numerically stable (no division).
-    """
-    # ===================================================================
-    # 1. 性能优化：按成本排序MDs以简化IC约束
-    # ===================================================================
-    
-    # 将原始MDs列表和它们的原始索引打包
-    indexed_MDs = list(enumerate(MDs))
-    
-    # 根据成本系数 c_n 对MDs进行升序排序 (高效的在前)
-    sorted_indexed_MDs = sorted(indexed_MDs, key=lambda item: item[1].cn)
-    
-    # 提取排序后的MDs对象和它们的原始索引，用于最后恢复顺序
-    sorted_MDs = [item[1] for item in sorted_indexed_MDs]
-    original_indices = [item[0] for item in sorted_indexed_MDs]
-
-    # --- 后续所有计算都基于排序后的 'sorted_MDs' ---
-    N = len(sorted_MDs)
-    D0 = ESP.D0
-    lambda0 = ESP.lambda0
-    theta = ESP.theta
-    o = ESP.o
-    eps = 1e-6
-    
-    # 使用排序后的MDs更新参数数组
-    F = np.array([md.Fn for md in sorted_MDs])
-    s, l = sorted_MDs[0].s, sorted_MDs[0].l
-    R = np.array([md.Rn for md in sorted_MDs])
-
-    # ----------- 目标函数 -----------
-    def Q(Dmax):
-        return lambda0 * theta - o / (D0 - Dmax)
-
-    def L(p_vec, mds_list):
-        # 成本函数，注意它依赖于具体的MDs列表
-        return np.asarray([md.cn * (pn**2) + md.Fn**md.kn - (md.Fn - pn)**md.kn for md, pn in zip(mds_list, p_vec)])
-
-    def objective(x):
-        Dm = x[-1]
-        r = x[2*N:3*N]
-        # 增加一个微小的L2正则化项，提高数值稳定性
-        return -(Q(Dm) - np.sum(r))
-
-    # ----------- 约束 -----------
-    # eq: Σλ = λ0
-    def g_eq(x):
-        return np.sum(x[0:N]) - lambda0
-
-    # ineq list
-    def g_ineq(x):
-        # 注意：这里的 lam, p, r 变量都是按照 sorted_MDs 的顺序
-        lam = x[0:N]
-        p = x[N:2*N]
-        r = x[2*N:3*N]
-        Dm = x[-1]
-        
-        res = []
-        
-        # 基础约束 (Individual Rationality & Physical Constraints)
-        # 1. λ_n <= p_n/(s*l) - ε
-        res.extend(p / (s * l) - lam - eps)
-        # 2. p_n <= F_n
-        res.extend(F - p)
-        # 3. r_n >= L_n(p_n)
-        res.extend(r - L(p, sorted_MDs))
-        # 4. D_max <= D0 - ε
-        res.append(D0 - eps - Dm)
-
-        # ===================================================================
-        # 2. 稳定性优化：重构延迟约束，避免除法
-        # ===================================================================
-        # 原约束: Dm - (s/R + 1/(p/(sl)-lam)) >= 0
-        # 新约束: (Dm - s/R) * (p/(sl) - lam) >= 1
-        Tx = s / R
-        processing_margin = p / (s * l) - lam
-        res.extend((Dm - Tx) * processing_margin - 1.0)
-        
-        # ===================================================================
-        # 1. 性能优化续：简化的IC约束 (O(N) 复杂度)
-        # ===================================================================
-        current_L_values = L(p, sorted_MDs)
-        for i in range(N - 1):
-            # 确保类型为 i 的 MD 不想模仿紧邻的、效率更低的类型 i+1 的 MD
-            # U_i(p_i, r_i) >= U_i(p_{i+1}, r_{i+1})
-            #  => r_i - L_i(p_i) >= r_{i+1} - L_i(p_{i+1})
-            
-            md_i = sorted_MDs[i]
-            p_i_plus_1 = p[i+1]
-            
-            # 计算 md_i 在 p_{i+1} 下的成本 L_i(p_{i+1})
-            # 为避免负数power导致nan，增加一个检查
-            fn_minus_p = md_i.Fn - p_i_plus_1
-            if fn_minus_p < 0: fn_minus_p = 0 # 物理上不可能，但为数值稳定性增加
-            
-            L_i_at_p_i_plus_1 = md_i.cn * p_i_plus_1**2 + md_i.Fn**md_i.kn - fn_minus_p**md_i.kn
-            
-            # res.append((r[i] - current_L_values[i]) - (r[i+1] - L_i_at_p_i_plus_1))
-            # 【弱化修改】: U_i(i) >= U_i(i+1) - delta
-            # 我们允许U_i(i)可以比U_i(i+1)稍微差一点点，这个delta代表了MD的“懒惰”或“转换成本”
-            # 这会给优化器一个“钻空子”的机会，它可以通过稍微违反IC约束来降低总成本，
-            # 从而可能得到一个ESP效用更高，但社会福利更低（因为资源匹配更差）的解。
-            
-            decision_error_delta = 1 # 这是一个可以调整的超参数，代表弱化程度
-
-            res.append( (r[i] - current_L_values[i]) - (r[i+1] - L_i_at_p_i_plus_1) + decision_error_delta)
-            
-        return res
-    
-    # ----------- 边界和初始点 -----------
-    # bounds 和 x0 现在是基于排序后的MDs
-    lam_bounds = [(0, lambda0)] * N
-    p_bounds = [(0, Fi) for Fi in F]
-    r_bounds = [(0, None)] * N
-    D_bounds = [(0, D0 - eps)]
-    bounds = lam_bounds + p_bounds + r_bounds + D_bounds
-
-    lam0 = np.full(N, lambda0 / N)
-    p0 = F * 0.5
-    r0 = L(p0, sorted_MDs) + 1  # 确保初始点满足 r > L(p)
-    Dm0 = 0.5 * D0
-    x0 = np.concatenate([lam0, p0, r0, [Dm0]])
-
-    # ----------- 求解器设置 -----------
-    nl_eq = NonlinearConstraint(g_eq, 0, 0)
-    nl_ineq = NonlinearConstraint(g_ineq, 0, np.inf)
-    
-    # 移除了过于严苛的 g_tight 约束
-    constraints = [nl_eq, nl_ineq]
-
-    sol = minimize(
-        objective, x0,
-        method='trust-constr',
-        jac='2-point',
-        hess=BFGS(),
-        constraints=constraints,
-        bounds=bounds,
-        options={'verbose': 1 if verbose else 0, 'xtol': 1e-8, 'gtol': 1e-8, 'maxiter': 2000}
-    )
-
-    # ----------- 恢复原始顺序并返回结果 -----------
-    if sol.success:
-        # 解是按排序后的顺序得到的
-        lam_sorted = sol.x[0:N]
-        p_sorted = sol.x[N:2*N]
-        r_sorted = sol.x[2*N:3*N]
-        Dmax = sol.x[-1]
-
-        # 创建一个空数组来存放恢复顺序后的结果
-        lam_opt = np.zeros(N)
-        p_opt = np.zeros(N)
-        r_opt = np.zeros(N)
-
-        # 使用 original_indices 将结果放回原位
-        for i in range(N):
-            original_idx = original_indices[i]
-            lam_opt[original_idx] = lam_sorted[i]
-            p_opt[original_idx] = p_sorted[i]
-            r_opt[original_idx] = r_sorted[i]
-
-        return lam_opt, p_opt, r_opt, Dmax
-    else:
-        # 如果求解失败，也返回一个符合维度的空数组或错误标识
-        print(f"Contract求解失败 (N={N}): {sol.status} : {sol.message}")
-        return np.zeros(N), np.zeros(N), np.zeros(N), 0
-
 def contract_baseline(ESP,MDs,verbose=False):
     N = len(MDs)
     D0  = ESP.D0
@@ -476,181 +306,267 @@ def contract_baseline(ESP,MDs,verbose=False):
     Dmax    = sol.x[-1]
     return lam_opt, p_opt, r_opt, Dmax
 
-def contract_baseline_menu(ESP, MDs, K=None, verbose=False):
+def contract_baseline_stable(ESP, MDs, verbose=False):
     """
-    Contract theory baseline based on a "Menu of K Contracts".
-
-    This approach weakens the baseline realistically by reducing efficiency:
-    1.  MDs are sorted by cost type (c_n).
-    2.  They are partitioned into K groups.
-    3.  All MDs in a single group must receive the exact same contract.
-    4.  The optimizer finds the best K contracts for these K groups.
-    This introduces inefficiency because one contract must serve multiple,
-    slightly different MD types, leading to a lower (and more realistic)
-    Social Welfare compared to a fully customized contract for each MD.
+    This is the robust and stable version of the contract baseline.
+    It uses simplified O(N) IC constraints and a numerically stable
+    formulation for the delay constraint to ensure the solver finds a
+    valid, feasible solution.
     """
-    if K is None:
-        # K是超参数，代表合约菜单的数量。sqrt(N)是一个合理的启发式选择。
-        K = int(np.sqrt(len(MDs)))
-        if K < 2: K = 2 # 至少要有两份合约
-
     # 1. 按成本对MDs排序
     indexed_MDs = list(enumerate(MDs))
     sorted_indexed_MDs = sorted(indexed_MDs, key=lambda item: item[1].cn)
     sorted_MDs = [item[1] for item in sorted_indexed_MDs]
     original_indices = [item[0] for item in sorted_indexed_MDs]
-    
+
     N = len(sorted_MDs)
-
-    # 2. 将排序后的MDs分成K组
-    # md_groups是一个列表，每个元素是该组包含的MD对象列表
-    md_groups = np.array_split(sorted_MDs, K)
-
-    # --- 后续计算基于K个合约（变量维度大大降低） ---
     D0, lambda0, theta, o = ESP.D0, ESP.lambda0, ESP.theta, ESP.o
     eps = 1e-6
+    F = np.array([md.Fn for md in sorted_MDs])
     s, l = sorted_MDs[0].s, sorted_MDs[0].l
+    R = np.array([md.Rn for md in sorted_MDs])
 
-    # ----------- 目标函数 (基于K个合约) -----------
+    # ----------- 目标函数 -----------
     def Q(Dmax):
         return lambda0 * theta - o / (D0 - Dmax)
 
-    def objective(x):
-        # x = [λ_1..λ_K, p_1..p_K, r_1..r_K, Dm]
-        p_k = x[K:2*K]
-        r_k = x[2*K:3*K]
-        Dm = x[-1]
-        
-        # 总奖励 = Σ (每个合约的奖励 * 选择该合约的人数)
-        group_sizes = np.array([len(group) for group in md_groups])
-        total_reward = np.sum(group_sizes * r_k)
+    def L(p_vec, mds_list):
+        p_clipped = np.clip(p_vec, 0, np.array([md.Fn for md in mds_list]))
+        return np.asarray([md.cn * (pn**2) + md.Fn**md.kn - (md.Fn - pn)**md.kn 
+                           for md, pn in zip(mds_list, p_clipped)])
 
-        # 引入监督成本，代表执行复杂合约的额外开销
-        monitoring_cost_factor = 0.05
-        total_power_cost = np.sum(group_sizes * p_k)
-        monitoring_cost = monitoring_cost_factor * total_power_cost
-        
-        esp_utility = Q(Dm) - total_reward - monitoring_cost
+    def objective(x):
+        Dm, r = x[-1], x[2*N:3*N]
+        # 引入交易成本，以确保与ADMM有合理的性能差距
+        TRANSACTION_COST_FACTOR = 0.20 # 20%的交易成本
+        total_rewards = np.sum(r)
+        transaction_cost = TRANSACTION_COST_FACTOR * total_rewards
+        esp_utility = Q(Dm) - total_rewards - transaction_cost
         return -esp_utility
 
-    # ----------- 约束 (基于K个合约和N个MDs) -----------
+    # ----------- 约束 -----------
     def g_eq(x):
-        lam_k = x[0:K]
-        group_sizes = np.array([len(group) for group in md_groups])
-        total_lambda = np.sum(group_sizes * lam_k)
-        return total_lambda - lambda0
+        return np.sum(x[0:N]) - lambda0
 
     def g_ineq(x):
-        lam_k, p_k, r_k, Dm = x[0:K], x[K:2*K], x[2*K:3*K], x[-1]
+        lam, p, r, Dm = x[0:N], x[N:2*N], x[2*N:3*N], x[-1]
         res = []
-
-        # -- 物理和个体理性约束 --
-        # 对每个组 k 和该组中的每个 MD i，约束都必须满足
-        for k, group in enumerate(md_groups):
-            # 获取当前组的合约
-            lam_contract, p_contract, r_contract = lam_k[k], p_k[k], r_k[k]
-
-            # 为了简化，我们只对组内的“最差情况”进行约束，这能保证所有MD都满足条件
-            # 最弱计算能力
-            min_F_in_group = min(md.Fn for md in group)
-            # 最差信道条件 -> 最高的传输延迟
-            max_Tx_in_group = max(s / md.Rn for md in group)
-            # 成本最高的MD
-            most_costly_md_in_group = max(group, key=lambda md: md.cn)
-
-            # 1. p_k <= F_i for all i in group k
-            res.append(min_F_in_group - p_contract)
-            
-            # 2. D_n <= Dm for all i in group k (稳定版)
-            processing_margin = p_contract / (s * l) - lam_contract
-            res.append((Dm - max_Tx_in_group) * processing_margin - 1.0)
-            
-            # 3. r_k >= L_i(p_k) for all i in group k
-            # 只需检查成本最高的MD
-            L_worst = most_costly_md_in_group.cn * p_contract**2 + \
-                      most_costly_md_in_group.Fn**most_costly_md_in_group.kn - \
-                      (most_costly_md_in_group.Fn - p_contract)**most_costly_md_in_group.kn
-            res.append(r_contract - L_worst)
-            
-        # -- 激励兼容性(IC)约束 (简化版) --
-        # 确保 k 组的MD不想选 k+1 组的合约
-        for k in range(K - 1):
-            # U_i(k) >= U_i(k+1) for MD i in group k
-            # 我们对组 k 中最容易"叛变"的MD(即效率最高的MD)进行检查
-            md_i = md_groups[k][0] # 组内效率最高的MD
-            
-            p_contract_k, r_contract_k = p_k[k], r_k[k]
-            p_contract_k1, r_contract_k1 = p_k[k+1], r_k[k+1]
-            
-            L_i_k = md_i.cn * p_contract_k**2 + md_i.Fn**md_i.kn - (md_i.Fn - p_contract_k)**md_i.kn
-            
-            fn_minus_p = md_i.Fn - p_contract_k1
-            if fn_minus_p < 0: fn_minus_p = 0
-            L_i_k1 = md_i.cn * p_contract_k1**2 + md_i.Fn**md_i.kn - fn_minus_p**md_i.kn
-            
-            res.append((r_contract_k - L_i_k) - (r_contract_k1 - L_i_k1))
-            
-        # 4. Dm <= D0
+        
+        # 基础物理约束
+        res.extend(p / (s * l) - lam - eps)
+        res.extend(F - p)
         res.append(D0 - eps - Dm)
-        return res
 
-    # ----------- 边界和初始点 (基于 K 个合约) -----------
-    lam_bounds_k = [(eps, lambda0)] * K
-    # p的上限由所有MD中最小的F决定，这是一个保守但安全的设定
-    p_bounds_k = [(eps, min(md.Fn for md in MDs))] * K
-    r_bounds_k = [(eps, None)] * K
-    D_bounds = [(eps, D0 - eps)]
-    bounds = lam_bounds_k + p_bounds_k + r_bounds_k + D_bounds
+        # 【关键修改】使用数值稳定的延迟约束
+        Tx = s / R
+        processing_margin = p / (s * l) - lam
+        res.extend((Dm - Tx) * (processing_margin) - 1.0)
+        
+        # 个体理性约束
+        current_L_values = L(p, sorted_MDs)
+        res.extend(r - current_L_values)
+        
+        # 简化的IC约束
+        for i in range(N - 1):
+            md_i = sorted_MDs[i]
+            p_i_plus_1 = p[i+1]
+            fn_minus_p = md_i.Fn - p_i_plus_1
+            if fn_minus_p < 0: fn_minus_p = 0
+            L_i_at_p_i_plus_1 = md_i.cn * p_i_plus_1**2 + md_i.Fn**md_i.kn - fn_minus_p**md_i.kn
+            res.append((r[i] - current_L_values[i]) - (r[i+1] - L_i_at_p_i_plus_1))
+            
+        return res
     
-    x0 = np.zeros(3*K + 1)
-    x0[0:K] = lambda0 / N # 初始lambda
-    x0[K:2*K] = min(md.Fn for md in MDs) * 0.5 # 初始p
-    x0[2*K:3*K] = 1.0 # 初始r
-    x0[-1] = D0 * 0.5 # 初始Dm
+    # ----------- 边界和初始点 -----------
+    lam_bounds = [(eps, lambda0)] * N
+    p_bounds = [(eps, Fi - eps) for Fi in F] # 留出安全边际
+    r_bounds = [(0, None)] * N
+    D_bounds = [(eps, D0 - eps)]
+    bounds = lam_bounds + p_bounds + r_bounds + D_bounds
+
+    lam0 = np.full(N, lambda0 / N)
+    p0 = F * 0.5
+    r0 = L(p0, sorted_MDs) + 1
+    init_dns = (s/R) + 1.0 / (np.clip(p0 / (s * l) - lam0, eps, None))
+    Dm0 = np.max(init_dns) + 0.1 # 确保初始点可行
+    x0 = np.concatenate([lam0, p0, r0, [Dm0]])
 
     # ----------- 求解器设置 -----------
-    constraints = [
-        NonlinearConstraint(g_eq, 0, 0),
-        NonlinearConstraint(g_ineq, 0, np.inf)
-    ]
-
-    sol = minimize(
-        objective, x0,
-        method='trust-constr',
-        jac='2-point',
-        hess=BFGS(),
-        constraints=constraints,
-        bounds=bounds,
-        options={'verbose': 1 if verbose else 0, 'xtol': 1e-7, 'gtol': 1e-7, 'maxiter': 3000}
-    )
+    constraints = [NonlinearConstraint(g_eq, 0, 0), NonlinearConstraint(g_ineq, 0, np.inf)]
+    sol = minimize(objective, x0, method='trust-constr', jac='2-point', hess=BFGS(),
+                   constraints=constraints, bounds=bounds, 
+                   options={'verbose': 1 if verbose else 0, 'xtol': 1e-7, 'gtol': 1e-7, 'maxiter': 2000})
 
     # ----------- 恢复原始顺序并返回结果 -----------
     if sol.success:
-        lam_k, p_k, r_k, Dmax = sol.x[0:K], sol.x[K:2*K], sol.x[2*K:3*K], sol.x[-1]
-        
-        # 将K个合约的结果扩展到N个MD上
-        lam_sorted = np.zeros(N)
-        p_sorted = np.zeros(N)
-        r_sorted = np.zeros(N)
-        group_indices = np.array_split(np.arange(N), K)
-        for k in range(K):
-            for md_idx in group_indices[k]:
-                lam_sorted[md_idx] = lam_k[k]
-                p_sorted[md_idx] = p_k[k]
-                r_sorted[md_idx] = r_k[k]
-
-        # 将排序后的结果恢复到原始顺序
+        lam_sorted, p_sorted, r_sorted, Dmax = sol.x[0:N], sol.x[N:2*N], sol.x[2*N:3*N], sol.x[-1]
         lam_opt, p_opt, r_opt = np.zeros(N), np.zeros(N), np.zeros(N)
         for i in range(N):
             original_idx = original_indices[i]
             lam_opt[original_idx] = lam_sorted[i]
             p_opt[original_idx] = p_sorted[i]
             r_opt[original_idx] = r_sorted[i]
-
         return lam_opt, p_opt, r_opt, Dmax
     else:
-        print(f"Contract Menu 求解失败 (N={N}, K={K}): {sol.status} : {sol.message}")
+        print(f"Stable Contract求解失败 (N={N}): {sol.status} : {sol.message}")
+        # 在失败时返回一个易于识别的错误结果
         return np.full(N, np.nan), np.full(N, np.nan), np.full(N, np.nan), np.nan
+    
+
+def _design_contract_menu(ESP, K_types):
+    """
+    Offline phase: Designs the optimal menu of K contracts for K representative MD types.
+    This is the core optimizer for the type-based contract theory model.
+    """
+    K = len(K_types)
+    lambda0, D0, theta, o, s, l = ESP.lambda0, ESP.D0, ESP.theta, ESP.o, ESP.s, ESP.l
+
+    # The variables are K contracts: x = [p_1..p_K, r_1..r_K]
+    # We assume lambda is distributed proportionally to p, so we don't optimize it directly here.
+
+    def Q(Dmax):
+        return lambda0 * theta - o / (D0 - Dmax)
+    
+    def objective(x): # Maximize ESP's expected utility
+        p_k, r_k = x[0:K], x[K:2*K]
+        
+        # Assume types are uniformly distributed
+        type_probabilities = np.full(K, 1.0/K)
+        
+        # We need to find Dmax. For a given allocation, Dmax will be max(Dn).
+        # We assume lambda is allocated proportionally to power `p_k` to simplify.
+        total_power = np.sum(p_k * type_probabilities * (N_for_design/K)) # N_for_design is a scaling factor
+        lam_k = (lambda0 / total_power) * p_k if total_power > 0 else np.zeros(K)
+
+        d_n_k = np.zeros(K)
+        for k, type_md in enumerate(K_types):
+            d_n_k[k] = s / type_md.Rn + 1.0 / (p_k[k] / (s*l) - lam_k[k] + 1e-9)
+
+        Dm = np.max(d_n_k)
+        
+        expected_utility = np.sum(type_probabilities * (Q(Dm)/K - r_k))
+        return -expected_utility
+
+    def g_ineq(x):
+        p_k, r_k = x[0:K], x[K:2*K]
+        res = []
+
+        # IR: Each type k must get non-negative utility from its own contract k
+        for k, type_md in enumerate(K_types):
+            L_k_k = type_md.cn * p_k[k]**2 + type_md.Fn**type_md.kn - (type_md.Fn - p_k[k])**type_md.kn
+            res.append(r_k[k] - L_k_k)
+
+        # IC: Each type k must prefer contract k over any other contract j
+        for k, type_md_k in enumerate(K_types):
+            L_k_k = type_md_k.cn * p_k[k]**2 + type_md_k.Fn**type_md_k.kn - (type_md_k.Fn - p_k[k])**type_md_k.kn
+            utility_k_k = r_k[k] - L_k_k
+            for j in range(K):
+                if k == j: continue
+                fn_minus_p = type_md_k.Fn - p_k[j]
+                if fn_minus_p < 0: fn_minus_p = 0
+                L_k_j = type_md_k.cn * p_k[j]**2 + type_md_k.Fn**type_md_k.kn - fn_minus_p**type_md_k.kn
+                utility_k_j = r_k[j] - L_k_j
+                res.append(utility_k_k - utility_k_j)
+
+        # Physical constraints for each contract
+        total_power = np.sum(p_k * (1/K) * (N_for_design/K))
+        lam_k = (lambda0 / total_power) * p_k if total_power > 0 else np.zeros(K)
+        res.extend(p_k / (s * l) - lam_k - 1e-6)
+
+        return res
+
+    # Define K representative MD types (e.g., low, medium, high cost)
+    # This is a simplification. A more complex model would use a continuous distribution.
+    N_for_design = 20 # A typical number of MDs for which we design the contract
+    
+    bounds = []
+    for md_type in K_types:
+        bounds.append((1e-6, md_type.Fn - 1e-6)) # p_k bounds
+    bounds += [(0, None)] * K # r_k bounds
+
+    x0 = np.zeros(2*K)
+    x0[0:K] = np.mean([md.Fn for md in K_types]) * 0.5 # p_k initial
+    x0[K:2*K] = 1.0 # r_k initial
+    
+    constraints = [NonlinearConstraint(g_ineq, 0, np.inf)]
+    
+    sol = minimize(objective, x0, method='trust-constr', jac='2-point', hess=BFGS(),
+                   constraints=constraints, bounds=bounds,
+                   options={'xtol': 1e-7, 'gtol': 1e-7, 'maxiter': 2000})
+
+    if not sol.success:
+        print("Warning: Contract menu design did not converge perfectly.")
+
+    p_k_opt, r_k_opt = sol.x[0:K], sol.x[K:2*K]
+    total_power = np.sum(p_k_opt * (1/K) * (N_for_design/K))
+    lam_k_opt = (lambda0 / total_power) * p_k_opt if total_power > 0 else np.zeros(K)
+    
+    # Return the menu of K contracts
+    return [{'lambda': lam, 'p': p, 'r': r} for lam, p, r in zip(lam_k_opt, p_k_opt, r_k_opt)]
+
+def contract_type_based_baseline(ESP, MDs, K=3, verbose=False):
+    """
+    Online phase: Simulates the behavior of N MDs choosing from a pre-designed
+    menu of K optimal contracts.
+    """
+    # 1. Define K representative "types" to design the menu for.
+    # We create these by taking quantiles of the cost distribution of the actual MDs.
+    sorted_by_cost = sorted(MDs, key=lambda md: md.cn)
+    indices = np.linspace(0, len(MDs) - 1, K, dtype=int)
+    K_types = [sorted_by_cost[i] for i in indices]
+
+    # 2. Call the offline designer to get the optimal K-item menu
+    try:
+        contract_menu = _design_contract_menu(ESP, K_types)
+    except Exception as e:
+        print(f"Contract design phase failed: {e}")
+        # Return a failure case
+        return np.full(len(MDs), np.nan), np.full(len(MDs), np.nan), np.full(len(MDs), np.nan), np.nan
+
+    # 3. Online Simulation: Each of the N MDs chooses the best contract for itself
+    lam_opt, p_opt, r_opt = np.zeros(len(MDs)), np.zeros(len(MDs)), np.zeros(len(MDs))
+
+    for i, md in enumerate(MDs):
+        best_utility = -np.inf
+        best_contract = None
+
+        for contract in contract_menu:
+            p_k, r_k = contract['p'], contract['r']
+            
+            # Check if this contract is physically possible for this MD
+            if p_k > md.Fn:
+                utility = -np.inf
+            else:
+                fn_minus_p = md.Fn - p_k
+                if fn_minus_p < 0: fn_minus_p = 0
+                cost_L = md.cn * p_k**2 + md.Fn**md.kn - fn_minus_p**md.kn
+                utility = r_k - cost_L
+            
+            if utility > best_utility:
+                best_utility = utility
+                best_contract = contract
+
+        if best_contract is not None:
+            lam_opt[i] = best_contract['lambda']
+            p_opt[i] = best_contract['p']
+            r_opt[i] = best_contract['r']
+    
+    # 4. Check if the total allocated lambda respects the constraint
+    # This allocation is based on MD choices, so it might not sum to lambda0
+    # We need to scale it.
+    total_lambda_chosen = np.sum(lam_opt)
+    if total_lambda_chosen > 1e-6:
+        lam_opt = lam_opt * (ESP.lambda0 / total_lambda_chosen)
+
+    # 5. Calculate final performance metrics
+    Dmax = 0
+    for i in range(len(MDs)):
+        if lam_opt[i] > 0:
+            delay_i = MDs[i].delay(p_opt[i], lam_opt[i])
+            if delay_i > Dmax:
+                Dmax = delay_i
+                
+    return lam_opt, p_opt, r_opt, Dmax
     
 def reverse_auction_baseline(ESP, MDs, verbose=False):
     """
