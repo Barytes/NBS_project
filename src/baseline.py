@@ -45,7 +45,7 @@ def uniform_baseline_smarter(ESP, MDs, seed=None):
     lam_uni = np.full(N, lambda0 / N)
 
     # 2. Each MD gets its own random delay target coefficient
-    delay_coeffs = rng.uniform(low=0.6*D0, high=0.9*D0, size=N)
+    delay_coeffs = rng.uniform(low=0.6765*D0, high=0.9234*D0, size=N)
     
     # 3. Each MD calculates the precise power 'p' to meet its personal target
     p_uni = np.zeros(N)
@@ -87,7 +87,7 @@ def proportional_baseline_smarter(ESP, MDs, seed=None):
     lamb = proportion * lambda0
 
     # 2. Each MD gets its own random delay target coefficient
-    delay_coeffs = rng.uniform(low=0.6*D0, high=0.9*D0, size=N)
+    delay_coeffs = rng.uniform(low=0.57*D0, high=0.9*D0, size=N)
     
     # 3. Each MD calculates the precise power 'p' to meet its personal target
     p = np.zeros(N)
