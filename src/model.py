@@ -71,7 +71,7 @@ class ESP:
         self.l = param["l"]
 
     def Q(self,Dmax):
-        if self.D0 < Dmax-1e-3: return None
+        if self.D0 < Dmax-1e-9: return None
         return self.lambda0*self.theta - self.o/(self.D0-Dmax)
     
     def utility(self,Dmax,r):
