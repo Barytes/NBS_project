@@ -1,6 +1,6 @@
 # src/baseline.py()
 import numpy as np
-from scipy.optimize import minimize, NonlinearConstraint, LinearConstraint
+from scipy.optimize import minimize, NonlinearConstraint, Bounds
 from scipy.optimize._hessian_update_strategy import BFGS
 
 def uniform_baseline(ESP, MDs,seed=None):
@@ -683,70 +683,7 @@ def contract_type_based_baseline(ESP, MDs, K=3, verbose=False):
 
     return lam_opt, p_opt, r_opt, Dmax
     
-def reverse_auction_baseline(ESP, MDs, verbose=False):
-    """
-    Reverse Auction Model Baseline.
-    1. MDs bid their marginal cost to provide service.
-    2. ESP, as the auctioneer, sorts bids from cheapest to most expensive.
-    3. ESP greedily "accepts" bids (allocates tasks) to the cheapest MDs until
-       the total task load (lambda0) is fulfilled.
-    This approach is suboptimal because it greedily focuses on cost and may
-    ignore other critical factors like channel conditions, leading to higher delay.
-    """
-    N = len(MDs)
-    lambda0 = ESP.lambda0
-    s, l = MDs[0].s, MDs[0].l
 
-    # 1. MDs submit bids. A simple and rational bid is their energy cost coefficient c_n.
-    # We also store original indices to reconstruct the final output.
-    bidders = sorted([(md.cn, i, md) for i, md in enumerate(MDs)])
-
-    lam_opt = np.zeros(N)
-    p_opt = np.zeros(N)
-    r_opt = np.zeros(N)
-    lambda_remaining = lambda0
-
-    # 2. ESP greedily accepts bids from cheapest to most expensive.
-    for bid, original_idx, md in bidders:
-        if lambda_remaining <= 0:
-            break
-
-        # For this MD, calculate the max tasks it can handle within its capacity
-        # We assume it will use all its power if chosen, a common greedy assumption.
-        p_assigned = md.Fn
-        
-        # Calculate max lambda this MD can handle without its queue becoming unstable
-        max_lam_for_md = p_assigned / (s * l) - 1e-6 # Leave a small margin
-
-        # Assign tasks: either all remaining tasks or the max it can handle.
-        lam_assigned = min(lambda_remaining, max_lam_for_md)
-        
-        if lam_assigned <= 0:
-            continue
-
-        lam_opt[original_idx] = lam_assigned
-        p_opt[original_idx] = p_assigned
-        
-        # 3. Payment: Pay-as-bid. Reward covers the cost.
-        cost_L = md.cn * p_assigned**2 + md.Fn**md.kn - (md.Fn - p_assigned)**md.kn
-        r_opt[original_idx] = cost_L  # At least cover the cost
-        
-        lambda_remaining -= lam_assigned
-
-    if lambda_remaining > 1e-5:
-        print(f"Auction Warning: Not all tasks were allocated. {lambda_remaining:.2f} remaining.")
-
-    # Calculate final Dmax based on the allocation
-    Dmax = 0
-    for i in range(N):
-        if lam_opt[i] > 0:
-            delay_i = MDs[i].delay(p_opt[i], lam_opt[i])
-            if delay_i > Dmax:
-                Dmax = delay_i
-
-    return lam_opt, p_opt, r_opt, Dmax
-
-def greedy_heuristic_baseline(ESP, MDs, verbose=False):
     """
     Greedy Heuristic Baseline.
     1. Defines a composite "efficiency score" for each MD, considering its
@@ -984,131 +921,248 @@ def solve_r_NBP(ESP, MDs, Dm, lam, p, verbose=False):
     r_opt = sol.x[0:N]
     return r_opt
 
-def optimal_NBP(ESP,MDs):
+def optimal_NBP(ESP, MDs, verbose=False):
     N = len(MDs)
-    D0  = ESP.D0
+    D0 = ESP.D0
     lambda0 = ESP.lambda0
     theta = ESP.theta
     o = ESP.o
     w0 = ESP.omega_0
-    w = [md.omega_n for md in MDs]
+    w = np.array([md.omega_n for md in MDs]) # 转换为numpy array
     eps = 1e-6
-    F = np.array([md.Fn for md in MDs])  # (N,)
-    s, l = MDs[0].s, MDs[0].l  # 所有MD的s和l相同
-    R = np.array([md.Rn for md in MDs])  # (N,)
+    F = np.array([md.Fn for md in MDs])
+    s, l = MDs[0].s, MDs[0].l
+    R = np.array([md.Rn for md in MDs])
 
-    # ----------- 目标函数 -----------
+    # ----------- 目标函数 (保持不变) -----------
     def Q(Dmax):
-        return lambda0*theta - o / (D0 - Dmax)
+        # 增加保护
+        if Dmax >= D0 - eps: return -1e20
+        return lambda0 * theta - o / (D0 - Dmax)
 
     def L(p):
-        return np.asarray([md.cn*(pn**2)+(md.Fn)**md.kn-(md.Fn-pn)**md.kn for md, pn in zip(MDs, p)])
+        p_clipped = np.clip(p, 0, F)
+        return np.asarray([md.cn * (pn**2) + md.Fn**md.kn - (md.Fn - pn)**md.kn 
+                           for md, pn in zip(MDs, p_clipped)])
 
     def objective(x):
-        lam = x[0:N]
-        p   = x[N:2*N]
-        r   = x[2*N:3*N]
-        Dm  = x[-1]
-        esp_arg = np.maximum(Q(Dm) - np.sum(r), eps)
-        md_arg = np.maximum(r - L(p), eps)
+        lam, p, r, Dm = x[0:N], x[N:2*N], x[2*N:3*N], x[-1]
+        
+        esp_arg = Q(Dm) - np.sum(r)
+        md_arg = r - L(p)
+        
+        # 如果参数即将变为负数，返回一个巨大的惩罚值，引导求解器回来
+        if esp_arg <= 0 or np.any(md_arg <= 0):
+            return 1e20
+
         term_esp = w0 * np.log(esp_arg)
-        term_md  = np.dot(w, np.log(md_arg))
-        # return -(term_esp + term_md)          # 最大化 → 取负
-        return -(term_esp + term_md)+0.1*np.linalg.norm(lam,2)          # 最大化 → 取负
+        term_md = np.dot(w, np.log(md_arg))
+        return -(term_esp + term_md) + 0.01 * np.linalg.norm(p, 2) # 增加一个小的正则项
 
-    # ----------- 约束 -----------
-    def Dn(lam, p):        # (N,)
-        Tx = s / R
-        Tc = 1.0 / (p / (s * l) - lam)
-        return Tx + Tc
-
-    # eq: Σλ = λ0
+    # ----------- 约束 (增加对r的约束) -----------
     def g_eq(x):
         return np.sum(x[0:N]) - lambda0
 
-    # ineq list
     def g_ineq(x):
-        lam = x[0:N]
-        p   = x[N:2*N]
-        r   = x[2*N:3*N]
-        Dm  = x[-1]
+        lam, p, r, Dm = x[0:N], x[N:2*N], x[2*N:3*N], x[-1]
         res = []
-        # 12c  λ ≤ p/(s l) - ε
+        
+        # 物理约束
         res.extend(p / (s * l) - lam - eps)
-        # 12d  p ≤ F_n
-        res.extend(F - p)
-        # 12e  D_n(λ,p) ≤ D_max
-        res.extend(Dm - Dn(lam, p))
-        # 12f  r_n ≥ 0
-        res.extend(r)
-        # Dm ≤ D0 - ε
+        # res.extend(F - p) # 由bounds处理
         res.append(D0 - eps - Dm)
+        Tx = s / R
+        processing_margin = p / (s * l) - lam
+        res.extend((Dm - Tx) * (processing_margin + eps) - 1.0)
+        
+        # 【关键增加】显式地将log函数的参数约束为正
+        # 这会给求解器一个明确的信号，而不是让它自己去试探悬崖
+        res.append(Q(Dm) - np.sum(r) - eps)
+        res.extend(r - L(p) - eps)
+        
         return res
-
-    # ----------- 初始可行点 -----------
-    lam0 = np.full(N, lambda0 / N)
-    p0   = F * 0.5
-    r0   = L(p0) + 1  # 确保 r0 > L(p0)，避免 log(0) 问题
-    Dm0  = 0.5 * D0
-    x0   = np.concatenate([lam0, p0, r0, [Dm0]])
-
-    nl_eq   = NonlinearConstraint(g_eq, 0, 0)
-    nl_ineq = NonlinearConstraint(g_ineq, 0, np.inf)
-
-    def zero_obj(x): 
-        return 0.0
-
-    x0_feas = minimize(
-        zero_obj, x0,
-        method='trust-constr',
-        jac = '2-point',
-        hess=BFGS(),
-        constraints=[nl_eq, nl_ineq],
-        options={'verbose': 0, 'xtol':1e-9, 'gtol':1e-9, 'maxiter':2000}
-    ).x
-
-    # 1. 等式残差
-    heq = np.asarray(g_eq(x0_feas))
-    # 2. 不等式残差
-    hineq = np.asarray(g_ineq(x0_feas))
-    # 3. 判断是否都在容差内
-    tol_eq   = 1e-8
-    tol_ineq = -1e-8  # 小于零一点点可以接受
-    if abs(heq) <= tol_eq and hineq.min() >= tol_ineq:
-        print("✅ 这个点严格满足所有约束（在容差范围内）。")
-    else:
-        print("❌ 约束未全部满足，需要进一步调试或增大可行域容差。")
-        # raise ValueError("初始可行点不满足约束条件！")
-
-    # bounds
+    
+    # ----------- 边界、约束和初始点 (核心修改) -----------
+    # 【核心修改】提供严格且合理的边界
     lam_bounds = [(eps, lambda0)] * N
-    p_bounds   = [(eps, Fi) for Fi in F]
-    r_bounds   = [(eps, None)] * N
+    p_bounds   = [(eps, Fi - eps) for Fi in F]
+    # r的上限可以粗略估计，例如总收益，防止其无限增长
+    r_bounds   = [(eps, lambda0 * theta)] * N
     D_bounds   = [(eps, D0 - eps)]
     bounds = lam_bounds + p_bounds + r_bounds + D_bounds
 
     cons = (
-        {'type': 'eq',   'fun': g_eq},
+        {'type': 'eq', 'fun': g_eq},
         {'type': 'ineq', 'fun': g_ineq},
     )
 
+    # 构造一个更安全的初始点
+    lam0 = np.full(N, lambda0 / N)
+    p0 = F * 0.5
+    r0 = L(p0) + 0.1
+    init_dns = (s/R) + 1.0 / (np.clip(p0 / (s * l) - lam0, eps, None))
+    Dm0 = np.max(init_dns) + 0.1
+    # 确保初始点满足 Q(Dm0) > Σr0
+    while Q(Dm0) <= np.sum(r0):
+        Dm0 = (Dm0 + D0) / 2
+    x0 = np.concatenate([lam0, p0, r0, [Dm0]])
+
+    # --- 求解 ---
     sol = minimize(
-        objective, x0_feas,
+        objective, x0,
         method='SLSQP',
         bounds=bounds,
         constraints=cons,
-        options={
-            'ftol': 1e-9,
-            'maxiter': 2000,
-            'disp': True
-        }
+        options={'ftol': 1e-6, 'maxiter': 2000, 'disp': verbose}
     )
 
-    if sol.status != 0:
-        print(f"求解失败：{sol.status} : {sol.message}")
+    if not sol.success:
+        print(f"Optimal_NBP 求解失败 (N={N}): {sol.message}")
+        return np.full(N, np.nan), np.full(N, np.nan), np.full(N, np.nan), np.nan
 
-    lam_opt = sol.x[0:N]
-    p_opt   = sol.x[N:2*N]
-    r_opt   = sol.x[2*N:3*N]
-    Dmax    = sol.x[-1]
+    lam_opt, p_opt, r_opt, Dmax = sol.x[0:N], sol.x[N:2*N], sol.x[2*N:3*N], sol.x[-1]
+    return lam_opt, p_opt, r_opt, Dmax
+
+
+def optimal_NBP_fast(ESP, MDs, verbose=False):
+    """
+    A fast and stable centralized solver for the NBP problem, specifically
+    configured for the 'trust-constr' method with analytical gradients
+    (Jacobian) and a BFGS Hessian approximation.
+    """
+    N = len(MDs)
+    D0, lambda0, theta, o = ESP.D0, ESP.lambda0, ESP.theta, ESP.o
+    w0, w = ESP.omega_0, np.array([md.omega_n for md in MDs])
+    eps = 1e-6
+    F = np.array([md.Fn for md in MDs])
+    s, l = MDs[0].s, MDs[0].l
+    R = np.array([md.Rn for md in MDs])
+    c = np.array([md.cn for md in MDs])
+    k = np.array([md.kn for md in MDs])
+
+    # --- 辅助函数 (包括导数) ---
+    def Q(Dmax):
+        if Dmax >= D0 - eps: return -1e20
+        return lambda0 * theta - o / (D0 - Dmax)
+
+    def dQ_dDmax(Dmax): # Q对Dmax的导数
+        if Dmax >= D0 - eps: return -1e20
+        return -o / ((D0 - Dmax)**2)
+
+    def L(p):
+        p_clipped = np.clip(p, 0, F)
+        return c * p_clipped**2 + F**k - (F - p_clipped)**k
+
+    def dL_dp(p): # L对p的导数向量
+        p_clipped = np.clip(p, 0, F - eps)
+        return 2 * c * p_clipped + k * (F - p_clipped)**(k - 1)
+
+    # --- 目标函数及其梯度 ---
+    def objective(x):
+        lam, p, r, Dm = x[0:N], x[N:2*N], x[2*N:3*N], x[-1]
+        esp_utility = Q(Dm) - np.sum(r)
+        md_utility = r - L(p)
+        if esp_utility <= eps or np.any(md_utility <= eps): return 1e20
+        
+        term_esp = w0 * np.log(esp_utility)
+        term_md = np.dot(w, np.log(md_utility))
+        return -(term_esp + term_md)
+
+    def gradient(x): # 目标函数的梯度
+        lam, p, r, Dm = x[0:N], x[N:2*N], x[2*N:3*N], x[-1]
+        esp_utility = Q(Dm) - np.sum(r)
+        md_utility = r - L(p)
+
+        if esp_utility <= eps or np.any(md_utility <= eps):
+            return np.zeros_like(x)
+
+        grad = np.zeros(3*N + 1)
+        # grad w.r.t. p_j: (w_j / U_j) * (dL_j/dp_j)
+        grad[N:2*N] = (w / md_utility) * dL_dp(p)
+        # grad w.r.t. r_j: (w_0 / U_0) - (w_j / U_j)
+        grad[2*N:3*N] = (w0 / esp_utility) - (w / md_utility)
+        # grad w.r.t. Dmax: (w_0 / U_0) * (dQ/dDmax)
+        grad[3*N] = (w0 / esp_utility) * dQ_dDmax(Dm)
+        
+        return -grad
+
+    # --- 约束及其雅可比矩阵 ---
+    def g_eq(x):
+        return np.sum(x[0:N]) - lambda0
+
+    def g_ineq(x):
+        lam, p, r, Dm = x[0:N], x[N:2*N], x[2*N:3*N], x[-1]
+        res = []
+        # 物理约束
+        res.extend(p / (s * l) - lam - eps) # 队列稳定
+        # IR 约束
+        res.extend(r - L(p) - eps)
+        # 延迟约束
+        Tx = s / R
+        processing_margin = p / (s * l) - lam
+        res.extend((Dm - Tx) * (processing_margin + eps) - 1.0)
+        return np.array(res)
+
+    def g_ineq_jac(x):
+        lam, p, r, Dm = x[0:N], x[N:2*N], x[2*N:3*N], x[-1]
+        num_constraints = 3 * N
+        num_vars = 3 * N + 1
+        J = np.zeros((num_constraints, num_vars))
+
+        # Part 1: Jacobian for Queue Stability constraints (N constraints)
+        # C_i = p_i/(s*l) - λ_i - ε
+        J[np.arange(N), np.arange(N)] = -1.0 # dC_i/dλ_i
+        J[np.arange(N), N + np.arange(N)] = 1.0 / (s * l) # dC_i/dp_i
+        
+        # Part 2: Jacobian for IR constraints (N constraints)
+        # C_i = r_i - L_i(p_i) - ε
+        J[N + np.arange(N), N + np.arange(N)] = -dL_dp(p) # dC_i/dp_i
+        J[N + np.arange(N), 2*N + np.arange(N)] = 1.0 # dC_i/dr_i
+        
+        # Part 3: Jacobian for Delay constraints (N constraints)
+        # C_i = (Dm - Tx_i) * (p_i/(s*l) - λ_i + ε) - 1
+        Tx = s / R
+        # dC_i/dλ_i
+        J[2*N + np.arange(N), np.arange(N)] = -(Dm - Tx)
+        # dC_i/dp_i
+        J[2*N + np.arange(N), N + np.arange(N)] = (Dm - Tx) / (s * l)
+        # dC_i/dDm
+        J[2*N + np.arange(N), 3*N] = p / (s*l) - lam + eps
+        
+        return J
+
+    # --- 边界和初始点 ---
+    lb = np.zeros(3*N + 1)
+    ub = np.full(3*N + 1, np.inf)
+    lb[0:N] = eps; ub[0:N] = lambda0
+    lb[N:2*N] = eps; ub[N:2*N] = F - eps
+    lb[2*N:3*N] = 0
+    lb[3*N] = eps; ub[3*N] = D0 - eps
+    bounds = Bounds(lb, ub)
+
+    x0 = np.zeros(3*N + 1)
+    # ... 构造安全的初始点 ...
+    lam0 = np.full(N, lambda0 / N)
+    p0 = F * 0.5
+    r0 = L(p0) + 0.1
+    init_dns = (s/R) + 1.0 / (np.clip(p0 / (s * l) - lam0, eps, None))
+    Dm0 = np.max(init_dns) + 0.1
+    while Q(Dm0) <= np.sum(r0): Dm0 = (Dm0 + D0) / 2
+    x0 = np.concatenate([lam0, p0, r0, [Dm0]])
+
+    # --- 求解器调用 ---
+    # 定义约束对象
+    eq_constraint = NonlinearConstraint(g_eq, 0, 0)
+    ineq_constraint = NonlinearConstraint(g_ineq, 0, np.inf, jac=g_ineq_jac)
+    
+    sol = minimize(objective, x0, method='trust-constr', jac=gradient, hess=BFGS(),
+                   constraints=[eq_constraint, ineq_constraint],
+                   bounds=bounds,
+                   options={'verbose': 1 if verbose else 0, 'maxiter': 500})
+
+    if not sol.success:
+        print(f"Fast Optimal_NBP (trust-constr) 求解失败 (N={N}): {sol.message}")
+        return np.full(N, np.nan), np.full(N, np.nan), np.full(N, np.nan), np.nan
+
+    lam_opt, p_opt, r_opt, Dmax = sol.x[0:N], sol.x[N:2*N], sol.x[2*N:3*N], sol.x[-1]
     return lam_opt, p_opt, r_opt, Dmax
