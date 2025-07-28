@@ -2,6 +2,7 @@
 import numpy as np
 from scipy.optimize import minimize, NonlinearConstraint, Bounds
 from scipy.optimize._hessian_update_strategy import BFGS
+import casadi as ca
 
 def uniform_baseline(ESP, MDs,seed=None):
     N = len(MDs)
@@ -1026,143 +1027,92 @@ def optimal_NBP(ESP, MDs, verbose=False):
 
 def optimal_NBP_fast(ESP, MDs, verbose=False):
     """
-    A fast and stable centralized solver for the NBP problem, specifically
-    configured for the 'trust-constr' method with analytical gradients
-    (Jacobian) and a BFGS Hessian approximation.
+    A high-performance centralized solver for the NBP problem using the
+    CasADi framework with the IPOPT solver.
     """
     N = len(MDs)
     D0, lambda0, theta, o = ESP.D0, ESP.lambda0, ESP.theta, ESP.o
     w0, w = ESP.omega_0, np.array([md.omega_n for md in MDs])
-    eps = 1e-6
+    eps = 1e-7  # CasADi is more stable, can use a smaller epsilon
     F = np.array([md.Fn for md in MDs])
     s, l = MDs[0].s, MDs[0].l
     R = np.array([md.Rn for md in MDs])
     c = np.array([md.cn for md in MDs])
     k = np.array([md.kn for md in MDs])
 
-    # --- 辅助函数 (包括导数) ---
-    def Q(Dmax):
-        if Dmax >= D0 - eps: return -1e20
-        return lambda0 * theta - o / (D0 - Dmax)
+    # 1. 创建一个CasADi优化实例
+    opti = ca.Opti()
 
-    def dQ_dDmax(Dmax): # Q对Dmax的导数
-        if Dmax >= D0 - eps: return -1e20
-        return -o / ((D0 - Dmax)**2)
+    # 2. 定义优化变量
+    lam = opti.variable(N)
+    p = opti.variable(N)
+    r = opti.variable(N)
+    Dm = opti.variable(1)
 
-    def L(p):
-        p_clipped = np.clip(p, 0, F)
-        return c * p_clipped**2 + F**k - (F - p_clipped)**k
+    # 3. 定义辅助表达式 (成本 L(p) 和 收益 Q(Dmax))
+    L_p = c * p**2 + F**k - (F - p)**k
+    Q_Dm = lambda0 * theta - o / (D0 - Dm)
 
-    def dL_dp(p): # L对p的导数向量
-        p_clipped = np.clip(p, 0, F - eps)
-        return 2 * c * p_clipped + k * (F - p_clipped)**(k - 1)
+    # 4. 定义目标函数 (最大化纳什积的对数)
+    esp_utility = Q_Dm - ca.sum1(r)
+    md_utility = r - L_p
+    
+    objective = -(w0 * ca.log(esp_utility) + ca.sum1(w * ca.log(md_utility)))
+    opti.minimize(objective)
 
-    # --- 目标函数及其梯度 ---
-    def objective(x):
-        lam, p, r, Dm = x[0:N], x[N:2*N], x[2*N:3*N], x[-1]
-        esp_utility = Q(Dm) - np.sum(r)
-        md_utility = r - L(p)
-        if esp_utility <= eps or np.any(md_utility <= eps): return 1e20
-        
-        term_esp = w0 * np.log(esp_utility)
-        term_md = np.dot(w, np.log(md_utility))
-        return -(term_esp + term_md)
+    # 5. 设置约束条件
+    # 任务守恒约束
+    opti.subject_to(ca.sum1(lam) == lambda0)
+    
+    # 物理约束
+    opti.subject_to(p / (s * l) - lam >= eps) # 队列稳定
+    
+    # 延迟约束 (稳定版)
+    Tx = s / R
+    processing_margin = p / (s * l) - lam
+    opti.subject_to((Dm - Tx) * processing_margin >= 1.0)
 
-    def gradient(x): # 目标函数的梯度
-        lam, p, r, Dm = x[0:N], x[N:2*N], x[2*N:3*N], x[-1]
-        esp_utility = Q(Dm) - np.sum(r)
-        md_utility = r - L(p)
+    # log函数的参数必须为正
+    opti.subject_to(esp_utility >= eps)
+    opti.subject_to(md_utility >= eps)
 
-        if esp_utility <= eps or np.any(md_utility <= eps):
-            return np.zeros_like(x)
+    # 6. 设置变量的边界
+    opti.subject_to(opti.bounded(eps, lam, lambda0))
+    opti.subject_to(opti.bounded(eps, p, F - eps))
+    opti.subject_to(opti.bounded(0, r, np.inf))
+    opti.subject_to(opti.bounded(eps, Dm, D0 - eps))
 
-        grad = np.zeros(3*N + 1)
-        # grad w.r.t. p_j: (w_j / U_j) * (dL_j/dp_j)
-        grad[N:2*N] = (w / md_utility) * dL_dp(p)
-        # grad w.r.t. r_j: (w_0 / U_0) - (w_j / U_j)
-        grad[2*N:3*N] = (w0 / esp_utility) - (w / md_utility)
-        # grad w.r.t. Dmax: (w_0 / U_0) * (dQ/dDmax)
-        grad[3*N] = (w0 / esp_utility) * dQ_dDmax(Dm)
-        
-        return -grad
-
-    # --- 约束及其雅可比矩阵 ---
-    def g_eq(x):
-        return np.sum(x[0:N]) - lambda0
-
-    def g_ineq(x):
-        lam, p, r, Dm = x[0:N], x[N:2*N], x[2*N:3*N], x[-1]
-        res = []
-        # 物理约束
-        res.extend(p / (s * l) - lam - eps) # 队列稳定
-        # IR 约束
-        res.extend(r - L(p) - eps)
-        # 延迟约束
-        Tx = s / R
-        processing_margin = p / (s * l) - lam
-        res.extend((Dm - Tx) * (processing_margin + eps) - 1.0)
-        return np.array(res)
-
-    def g_ineq_jac(x):
-        lam, p, r, Dm = x[0:N], x[N:2*N], x[2*N:3*N], x[-1]
-        num_constraints = 3 * N
-        num_vars = 3 * N + 1
-        J = np.zeros((num_constraints, num_vars))
-
-        # Part 1: Jacobian for Queue Stability constraints (N constraints)
-        # C_i = p_i/(s*l) - λ_i - ε
-        J[np.arange(N), np.arange(N)] = -1.0 # dC_i/dλ_i
-        J[np.arange(N), N + np.arange(N)] = 1.0 / (s * l) # dC_i/dp_i
-        
-        # Part 2: Jacobian for IR constraints (N constraints)
-        # C_i = r_i - L_i(p_i) - ε
-        J[N + np.arange(N), N + np.arange(N)] = -dL_dp(p) # dC_i/dp_i
-        J[N + np.arange(N), 2*N + np.arange(N)] = 1.0 # dC_i/dr_i
-        
-        # Part 3: Jacobian for Delay constraints (N constraints)
-        # C_i = (Dm - Tx_i) * (p_i/(s*l) - λ_i + ε) - 1
-        Tx = s / R
-        # dC_i/dλ_i
-        J[2*N + np.arange(N), np.arange(N)] = -(Dm - Tx)
-        # dC_i/dp_i
-        J[2*N + np.arange(N), N + np.arange(N)] = (Dm - Tx) / (s * l)
-        # dC_i/dDm
-        J[2*N + np.arange(N), 3*N] = p / (s*l) - lam + eps
-        
-        return J
-
-    # --- 边界和初始点 ---
-    lb = np.zeros(3*N + 1)
-    ub = np.full(3*N + 1, np.inf)
-    lb[0:N] = eps; ub[0:N] = lambda0
-    lb[N:2*N] = eps; ub[N:2*N] = F - eps
-    lb[2*N:3*N] = 0
-    lb[3*N] = eps; ub[3*N] = D0 - eps
-    bounds = Bounds(lb, ub)
-
-    x0 = np.zeros(3*N + 1)
-    # ... 构造安全的初始点 ...
+    # 7. 设置初始值 (有助于收敛)
     lam0 = np.full(N, lambda0 / N)
     p0 = F * 0.5
-    r0 = L(p0) + 0.1
+    r0 = c * p0**2 + F**k - (F - p0)**k + 0.1
     init_dns = (s/R) + 1.0 / (np.clip(p0 / (s * l) - lam0, eps, None))
     Dm0 = np.max(init_dns) + 0.1
-    while Q(Dm0) <= np.sum(r0): Dm0 = (Dm0 + D0) / 2
-    x0 = np.concatenate([lam0, p0, r0, [Dm0]])
-
-    # --- 求解器调用 ---
-    # 定义约束对象
-    eq_constraint = NonlinearConstraint(g_eq, 0, 0)
-    ineq_constraint = NonlinearConstraint(g_ineq, 0, np.inf, jac=g_ineq_jac)
     
-    sol = minimize(objective, x0, method='trust-constr', jac=gradient, hess=BFGS(),
-                   constraints=[eq_constraint, ineq_constraint],
-                   bounds=bounds,
-                   options={'verbose': 1 if verbose else 0, 'maxiter': 500})
+    opti.set_initial(lam, lam0)
+    opti.set_initial(p, p0)
+    opti.set_initial(r, r0)
+    opti.set_initial(Dm, Dm0)
 
-    if not sol.success:
-        print(f"Fast Optimal_NBP (trust-constr) 求解失败 (N={N}): {sol.message}")
+    # 8. 配置并调用求解器
+    solver_opts = {}
+    if not verbose:
+        solver_opts['print_time'] = 0
+        solver_opts['ipopt.print_level'] = 0
+    
+    opti.solver('ipopt', solver_opts)
+
+    try:
+        sol = opti.solve()
+        
+        # 9. 提取结果
+        lam_opt = sol.value(lam)
+        p_opt = sol.value(p)
+        r_opt = sol.value(r)
+        Dmax_opt = sol.value(Dm)
+        
+        return lam_opt, p_opt, r_opt, Dmax_opt
+
+    except RuntimeError as e:
+        print(f"CasADi/IPOPT 求解失败 (N={N}): {e}")
         return np.full(N, np.nan), np.full(N, np.nan), np.full(N, np.nan), np.nan
-
-    lam_opt, p_opt, r_opt, Dmax = sol.x[0:N], sol.x[N:2*N], sol.x[2*N:3*N], sol.x[-1]
-    return lam_opt, p_opt, r_opt, Dmax
